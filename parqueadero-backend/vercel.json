@@ -1,10 +1,5 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "functions": {
-    "api/index.py": {
-      "excludeFiles": "{.venv/**,__pycache__/**,**/__pycache__/**,*.db,*.sqlite,*.sqlite3}"
-    }
-  },
   "rewrites": [
     {
       "source": "/(.*)",
