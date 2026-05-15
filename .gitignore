@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# Local database / runtime files
+*.db
+*.sqlite
+*.sqlite3
+parqueadero-backend/parqueadero.db
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Vercel
+.vercel/
+
+# Logs
+*.log

@@ -1,0 +1,911 @@
+import base64
+import hashlib
+import json
+import os
+import secrets
+import urllib.parse
+import uuid
+from contextlib import asynccontextmanager
+from datetime import date, datetime, time, timedelta, timezone
+from pathlib import Path
+from typing import Annotated, Generator, Optional
+from zoneinfo import ZoneInfo
+
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.security import OAuth2PasswordBearer
+from fastapi.staticfiles import StaticFiles
+import httpx
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from pydantic import BaseModel, Field, StringConstraints, field_validator
+from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text, create_engine, select, text, inspect
+from sqlalchemy.orm import Session, declarative_base, sessionmaker
+
+APP_TZ = ZoneInfo(os.getenv("APP_TIMEZONE", "America/Bogota"))
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "720"))
+SECRET_KEY = os.getenv("JWT_SECRET") or secrets.token_urlsafe(48)
+OIDC_ISSUER = os.getenv("OIDC_ISSUER", os.getenv("LMS_AUTH_URL", "https://auth-meli.adminml.com")).rstrip("/")
+OIDC_CLIENT_ID = os.getenv("OIDC_CLIENT_ID", "").strip()
+OIDC_CLIENT_SECRET = os.getenv("OIDC_CLIENT_SECRET", "").strip()
+OIDC_SCOPES = os.getenv("OIDC_SCOPES", "openid profile email").strip()
+OIDC_STATE_COOKIE = "parking_oidc_state"
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+LOCAL_LOGIN_ENABLED = os.getenv("LOCAL_LOGIN_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+OIDC_ADMIN_USERS = {
+    value.strip().lower()
+    for value in os.getenv("OIDC_ADMIN_USERS", "").split(",")
+    if value.strip()
+}
+OIDC_ADMIN_GROUPS = {
+    value.strip().lower()
+    for value in os.getenv("OIDC_ADMIN_GROUPS", "").split(",")
+    if value.strip()
+}
+
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./parqueadero.db")
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
+elif DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+
+engine_kwargs = {}
+if DATABASE_URL.startswith("sqlite"):
+    engine_kwargs["connect_args"] = {"check_same_thread": False}
+
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, **engine_kwargs)
+SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+Base = declarative_base()
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    username = Column(String(120), unique=True, index=True, nullable=False)
+    password_hash = Column(String(255), nullable=False)
+    role = Column(String(30), nullable=False, default="operador")
+    active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime, nullable=False, default=lambda: utc_now())
+
+
+class ParkingVisit(Base):
+    __tablename__ = "parking_visits"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    ficha_code = Column(String(80), index=True, nullable=False)
+    placa = Column(String(16), index=True, nullable=False)
+    cedula = Column(String(30), index=True, nullable=True)
+    ruta = Column(String(120), index=True, nullable=False)
+    ubicacion = Column(String(120), index=True, nullable=False)
+    dock = Column(String(80), index=True, nullable=False)
+    conductor = Column(String(120), nullable=True)
+    observaciones = Column(Text, nullable=True)
+    salida_observaciones = Column(Text, nullable=True)
+    ingreso_at = Column(DateTime, index=True, nullable=False)
+    salida_at = Column(DateTime, index=True, nullable=True)
+    duracion_min = Column(Integer, nullable=True)
+    operador_ingreso = Column(String(120), nullable=False)
+    operador_salida = Column(String(120), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=lambda: utc_now())
+    updated_at = Column(DateTime, nullable=False, default=lambda: utc_now())
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def as_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def to_local(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt is None:
+        return None
+    return as_utc(dt).astimezone(APP_TZ)
+
+
+def local_day_bounds(day: date) -> tuple[datetime, datetime]:
+    start_local = datetime.combine(day, time.min, tzinfo=APP_TZ)
+    end_local = start_local + timedelta(days=1)
+    return (
+        start_local.astimezone(timezone.utc).replace(tzinfo=None),
+        end_local.astimezone(timezone.utc).replace(tzinfo=None),
+    )
+
+
+def local_range_bounds(from_day: date, to_day: date) -> tuple[datetime, datetime]:
+    start_local = datetime.combine(from_day, time.min, tzinfo=APP_TZ)
+    end_local = datetime.combine(to_day + timedelta(days=1), time.min, tzinfo=APP_TZ)
+    return (
+        start_local.astimezone(timezone.utc).replace(tzinfo=None),
+        end_local.astimezone(timezone.utc).replace(tzinfo=None),
+    )
+
+
+def parse_date_str(value: Optional[str], default: Optional[date] = None) -> date:
+    if not value:
+        if default is None:
+            raise HTTPException(status_code=400, detail="Fecha requerida")
+        return default
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Formato de fecha inválido") from exc
+
+
+def get_db() -> Generator[Session, None, None]:
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def verify_password(plain_password: str, password_hash: str) -> bool:
+    return pwd_context.verify(plain_password, password_hash)
+
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+
+def normalize_placa(value: str) -> str:
+    return value.strip().upper().replace(" ", "")
+
+
+def create_access_token(username: str, role: str) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    payload = {"sub": username, "role": role, "exp": expire}
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def oidc_is_configured() -> bool:
+    return bool(OIDC_CLIENT_ID)
+
+
+def pkce_challenge(verifier: str) -> str:
+    digest = hashlib.sha256(verifier.encode("utf-8")).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def oidc_cookie_secure(request: Request) -> bool:
+    return request.url.scheme == "https" or PUBLIC_BASE_URL.startswith("https://")
+
+
+def public_url_for(request: Request, route_name: str) -> str:
+    internal_url = str(request.url_for(route_name))
+    if not PUBLIC_BASE_URL:
+        return internal_url
+    parsed = urllib.parse.urlparse(internal_url)
+    return f"{PUBLIC_BASE_URL}{parsed.path}"
+
+
+async def get_oidc_metadata() -> dict:
+    metadata_url = f"{OIDC_ISSUER}/.well-known/openid-configuration"
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
+            response = await client.get(metadata_url)
+            response.raise_for_status()
+            metadata = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="No se pudo consultar la configuración LMS/Okta") from exc
+
+    issuer = metadata.get("issuer")
+    if issuer != OIDC_ISSUER:
+        raise HTTPException(status_code=503, detail="Issuer LMS/Okta inválido")
+    return metadata
+
+
+def state_payload_from_cookie(request: Request, state: str) -> dict:
+    token = request.cookies.get(OIDC_STATE_COOKIE)
+    if not token:
+        raise HTTPException(status_code=400, detail="Sesión SSO expirada")
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except JWTError as exc:
+        raise HTTPException(status_code=400, detail="Estado SSO inválido") from exc
+    if payload.get("state") != state:
+        raise HTTPException(status_code=400, detail="Estado SSO no coincide")
+    verifier = payload.get("code_verifier")
+    if not isinstance(verifier, str) or len(verifier) < 43:
+        raise HTTPException(status_code=400, detail="Verificador SSO inválido")
+    return payload
+
+
+def role_from_oidc_userinfo(username: str, userinfo: dict) -> str:
+    username_key = username.strip().lower()
+    groups_value = userinfo.get("groups")
+    groups = groups_value if isinstance(groups_value, list) else []
+    normalized_groups = {str(group).strip().lower() for group in groups}
+    if username_key in OIDC_ADMIN_USERS or normalized_groups.intersection(OIDC_ADMIN_GROUPS):
+        return "admin"
+    return "operador"
+
+
+def get_or_create_oidc_user(db: Session, username: str, role: str) -> User:
+    username = username.strip()[:120]
+    if not username:
+        raise HTTPException(status_code=401, detail="El LMS no retornó usuario válido")
+    user = db.scalar(select(User).where(User.username == username))
+    if user:
+        if not user.active:
+            raise HTTPException(status_code=403, detail="Usuario inactivo")
+        if user.role != role and role == "admin":
+            user.role = "admin"
+            db.commit()
+            db.refresh(user)
+        return user
+    user = User(
+        username=username,
+        password_hash=hash_password(secrets.token_urlsafe(32)),
+        role=role,
+        active=True,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username = payload.get("sub")
+        if not isinstance(username, str) or not username:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="No autorizado")
+    except JWTError as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="No autorizado") from exc
+
+    user = db.scalar(select(User).where(User.username == username, User.active.is_(True)))
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="No autorizado")
+    return user
+
+
+def require_admin(user: User = Depends(get_current_user)) -> User:
+    if user.role != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Acceso denegado")
+    return user
+
+
+FichaCode = Annotated[str, StringConstraints(strip_whitespace=True, min_length=2, max_length=80, pattern=r"^[A-Za-z0-9._:/-]+$")]
+Placa = Annotated[str, StringConstraints(strip_whitespace=True, min_length=4, max_length=16, pattern=r"^[A-Za-z0-9-]+$")]
+ShortText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120)]
+OptionalText = Annotated[str, StringConstraints(strip_whitespace=True, max_length=300)]
+Username = Annotated[str, StringConstraints(strip_whitespace=True, min_length=3, max_length=120, pattern=r"^[A-Za-z0-9@._-]+$")]
+Password = Annotated[str, StringConstraints(min_length=8, max_length=128)]
+LoginPassword = Annotated[str, StringConstraints(min_length=1, max_length=128)]
+Role = Annotated[str, StringConstraints(strip_whitespace=True, pattern=r"^(admin|operador)$")]
+
+
+class LoginRequest(BaseModel):
+    username: Username
+    password: LoginPassword
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    username: str
+    role: str
+
+
+class UserCreateRequest(BaseModel):
+    username: Username
+    password: Password
+    role: Role = "operador"
+
+
+class UserResponse(BaseModel):
+    id: str
+    username: str
+    role: str
+    active: bool
+
+
+class FichaRequest(BaseModel):
+    ficha_code: FichaCode
+
+
+class IngresoRequest(BaseModel):
+    ficha_code: FichaCode = Field(..., description="Código escaneado de la ficha física")
+    placa: Placa
+    ruta: ShortText
+    ubicacion: ShortText
+    dock: ShortText
+    cedula: Optional[Annotated[str, StringConstraints(strip_whitespace=True, max_length=30, pattern=r"^[A-Za-z0-9._-]*$")]] = None
+    conductor: Optional[OptionalText] = None
+    observaciones: Optional[OptionalText] = None
+
+    @field_validator("placa")
+    @classmethod
+    def placa_upper(cls, value: str) -> str:
+        return normalize_placa(value)
+
+
+class SalidaRequest(BaseModel):
+    ficha_code: FichaCode
+    observaciones: Optional[OptionalText] = None
+
+
+class VisitResponse(BaseModel):
+    id: str
+    ficha_code: str
+    placa: str
+    ruta: str
+    ubicacion: str
+    dock: str
+    cedula: Optional[str]
+    conductor: Optional[str]
+    observaciones: Optional[str]
+    salida_observaciones: Optional[str]
+    ingreso_at: str
+    ingreso_fecha: str
+    ingreso_hora: str
+    salida_at: Optional[str]
+    salida_fecha: Optional[str]
+    salida_hora: Optional[str]
+    duracion_min: Optional[int]
+    duracion_formato: str
+    estado: str
+    operador_ingreso: str
+    operador_salida: Optional[str]
+
+
+class FichaStatusResponse(BaseModel):
+    ficha_code: str
+    estado: str
+    visit: Optional[VisitResponse]
+
+
+def format_duration(minutes: Optional[int]) -> str:
+    if minutes is None:
+        return "En patio"
+    hours = minutes // 60
+    mins = minutes % 60
+    if hours:
+        return f"{hours}h {mins}min"
+    return f"{mins}min"
+
+
+def visit_to_response(visit: ParkingVisit) -> dict:
+    ingreso_local = to_local(visit.ingreso_at)
+    salida_local = to_local(visit.salida_at)
+    if ingreso_local is None:
+        raise HTTPException(status_code=500, detail="Error interno")
+    return {
+        "id": visit.id,
+        "ficha_code": visit.ficha_code,
+        "placa": visit.placa,
+        "ruta": visit.ruta,
+        "cedula": visit.cedula,
+        "ubicacion": visit.ubicacion,
+        "dock": visit.dock,
+        "conductor": visit.conductor,
+        "observaciones": visit.observaciones,
+        "salida_observaciones": visit.salida_observaciones,
+        "ingreso_at": ingreso_local.isoformat(timespec="minutes"),
+        "ingreso_fecha": ingreso_local.date().isoformat(),
+        "ingreso_hora": ingreso_local.strftime("%H:%M"),
+        "salida_at": salida_local.isoformat(timespec="minutes") if salida_local else None,
+        "salida_fecha": salida_local.date().isoformat() if salida_local else None,
+        "salida_hora": salida_local.strftime("%H:%M") if salida_local else None,
+        "duracion_min": visit.duracion_min,
+        "duracion_formato": format_duration(visit.duracion_min),
+        "estado": "Completado" if visit.salida_at else "En patio",
+        "operador_ingreso": visit.operador_ingreso,
+        "operador_salida": visit.operador_salida,
+    }
+
+
+def active_by_ficha(db: Session, ficha_code: str) -> Optional[ParkingVisit]:
+    return db.scalar(
+        select(ParkingVisit).where(
+            ParkingVisit.ficha_code == ficha_code,
+            ParkingVisit.salida_at.is_(None),
+        )
+    )
+
+
+def ensure_schema_columns() -> None:
+    """Pequeña migración segura para desarrollo local cuando agregamos campos nuevos."""
+    inspector = inspect(engine)
+    existing_tables = inspector.get_table_names()
+    if "parking_visits" not in existing_tables:
+        return
+    columns = {column["name"] for column in inspector.get_columns("parking_visits")}
+    if "cedula" not in columns:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE parking_visits ADD COLUMN cedula VARCHAR(30)"))
+
+
+def seed_admin_user() -> None:
+    username = os.getenv("ADMIN_USERNAME")
+    password = os.getenv("ADMIN_PASSWORD")
+    if not username or not password:
+        return
+
+    with SessionLocal() as db:
+        existing = db.scalar(select(User).where(User.username == username))
+        if existing:
+            return
+        db.add(User(username=username, password_hash=hash_password(password), role="admin", active=True))
+        db.commit()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    Base.metadata.create_all(bind=engine)
+    ensure_schema_columns()
+    seed_admin_user()
+    yield
+
+
+app = FastAPI(title="Sistema de Parqueadero por Fichas", version="2.0.0", lifespan=lifespan)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return await request_validation_exception_handler(request, exc)
+
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(status_code=500, content={"detail": "Error interno del servidor"})
+
+
+@app.post("/api/auth/login", response_model=TokenResponse)
+def login(body: LoginRequest, db: Session = Depends(get_db)):
+    if not LOCAL_LOGIN_ENABLED:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Login local deshabilitado")
+    user = db.scalar(select(User).where(User.username == body.username, User.active.is_(True)))
+    if not user or not verify_password(body.password, user.password_hash):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Usuario o contraseña inválidos")
+    token = create_access_token(user.username, user.role)
+    return TokenResponse(access_token=token, username=user.username, role=user.role)
+
+
+@app.get("/api/auth/settings")
+def auth_settings(request: Request):
+    callback_url = public_url_for(request, "oidc_callback")
+    return {
+        "provider": "MELI/Okta",
+        "local_login_enabled": LOCAL_LOGIN_ENABLED,
+        "oidc_enabled": oidc_is_configured(),
+        "issuer": OIDC_ISSUER,
+        "authorization_url": f"{OIDC_ISSUER}/oauth2/v1/authorize",
+        "callback_url": callback_url,
+        "missing": [] if oidc_is_configured() else ["OIDC_CLIENT_ID"],
+    }
+
+
+@app.get("/api/auth/oidc/login")
+async def oidc_login(request: Request):
+    if not oidc_is_configured():
+        raise HTTPException(status_code=503, detail="Falta configurar OIDC_CLIENT_ID para login LMS/MELI")
+
+    metadata = await get_oidc_metadata()
+    authorization_endpoint = metadata.get("authorization_endpoint")
+    if not isinstance(authorization_endpoint, str):
+        raise HTTPException(status_code=503, detail="Endpoint de autorización LMS inválido")
+
+    state = secrets.token_urlsafe(32)
+    nonce = secrets.token_urlsafe(32)
+    code_verifier = secrets.token_urlsafe(64)
+    cookie_token = jwt.encode(
+        {
+            "state": state,
+            "nonce": nonce,
+            "code_verifier": code_verifier,
+            "exp": datetime.now(timezone.utc) + timedelta(minutes=10),
+        },
+        SECRET_KEY,
+        algorithm=ALGORITHM,
+    )
+
+    redirect_uri = public_url_for(request, "oidc_callback")
+    params = {
+        "client_id": OIDC_CLIENT_ID,
+        "response_type": "code",
+        "scope": OIDC_SCOPES,
+        "redirect_uri": redirect_uri,
+        "state": state,
+        "nonce": nonce,
+        "code_challenge": pkce_challenge(code_verifier),
+        "code_challenge_method": "S256",
+    }
+    query = urllib.parse.urlencode(params)
+    response = RedirectResponse(f"{authorization_endpoint}?{query}")
+    response.set_cookie(
+        OIDC_STATE_COOKIE,
+        cookie_token,
+        max_age=600,
+        httponly=True,
+        secure=oidc_cookie_secure(request),
+        samesite="lax",
+    )
+    return response
+
+
+@app.get("/api/auth/oidc/callback", name="oidc_callback")
+async def oidc_callback(
+    request: Request,
+    code: Optional[str] = Query(default=None, max_length=2048),
+    state: Optional[str] = Query(default=None, max_length=256),
+    error: Optional[str] = Query(default=None, max_length=256),
+    db: Session = Depends(get_db),
+):
+    if error:
+        return HTMLResponse("""<!doctype html><html lang='es'><head><meta charset='utf-8'><meta http-equiv='refresh' content='4;url=/'><title>Login LMS</title></head><body style='font-family:Arial;padding:32px'><h2>No se completó el login LMS</h2><p>Okta/MELI canceló o rechazó la autenticación.</p><p><a href='/'>Volver al inicio</a></p></body></html>""", status_code=401)
+    if not code or not state:
+        return HTMLResponse("""<!doctype html><html lang='es'><head><meta charset='utf-8'><meta http-equiv='refresh' content='4;url=/'><title>Login LMS</title></head><body style='font-family:Arial;padding:32px'><h2>Esta URL no se abre directamente</h2><p>Primero debes iniciar el flujo desde el botón <b>Iniciar con LMS/MELI</b>. Si estás en desarrollo, usa el login local.</p><p><a href='/'>Volver al inicio</a></p></body></html>""", status_code=400)
+    payload = state_payload_from_cookie(request, state)
+    metadata = await get_oidc_metadata()
+    token_endpoint = metadata.get("token_endpoint")
+    userinfo_endpoint = metadata.get("userinfo_endpoint")
+    if not isinstance(token_endpoint, str) or not isinstance(userinfo_endpoint, str):
+        raise HTTPException(status_code=503, detail="Endpoints LMS inválidos")
+
+    token_body = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": public_url_for(request, "oidc_callback"),
+        "client_id": OIDC_CLIENT_ID,
+        "code_verifier": payload["code_verifier"],
+    }
+    if OIDC_CLIENT_SECRET:
+        token_body["client_secret"] = OIDC_CLIENT_SECRET
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
+            token_response = await client.post(token_endpoint, data=token_body)
+            token_response.raise_for_status()
+            token_data = token_response.json()
+            access_token = token_data.get("access_token")
+            if not isinstance(access_token, str):
+                raise HTTPException(status_code=401, detail="El LMS no entregó access token")
+            userinfo_response = await client.get(userinfo_endpoint, headers={"Authorization": f"Bearer {access_token}"})
+            userinfo_response.raise_for_status()
+            userinfo = userinfo_response.json()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=401, detail="No se pudo completar el login LMS") from exc
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="Error consultando LMS") from exc
+
+    username = (
+        userinfo.get("preferred_username")
+        or userinfo.get("email")
+        or userinfo.get("nickname")
+        or userinfo.get("sub")
+    )
+    if not isinstance(username, str):
+        raise HTTPException(status_code=401, detail="El LMS no retornó identificador de usuario")
+
+    role = role_from_oidc_userinfo(username, userinfo)
+    user = get_or_create_oidc_user(db, username, role)
+    app_token = create_access_token(user.username, user.role)
+    html = f"""<!doctype html><html><head><meta charset='utf-8'><title>Login LMS</title></head>
+<body>
+<script>
+localStorage.setItem('parking_token', {json.dumps(app_token)});
+localStorage.setItem('parking_user', JSON.stringify({json.dumps({'username': user.username, 'role': user.role})}));
+window.location.replace('/');
+</script>
+<p>Login LMS correcto. Redirigiendo...</p>
+</body></html>"""
+    response = HTMLResponse(html)
+    response.delete_cookie(OIDC_STATE_COOKIE)
+    return response
+
+
+@app.get("/api/me", response_model=UserResponse)
+def me(user: User = Depends(get_current_user)):
+    return UserResponse(id=user.id, username=user.username, role=user.role, active=user.active)
+
+
+@app.post("/api/users", response_model=UserResponse, status_code=201)
+def create_user(body: UserCreateRequest, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    existing = db.scalar(select(User).where(User.username == body.username))
+    if existing:
+        raise HTTPException(status_code=409, detail="El usuario ya existe")
+    user = User(username=body.username, password_hash=hash_password(body.password), role=body.role, active=True)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return UserResponse(id=user.id, username=user.username, role=user.role, active=user.active)
+
+
+@app.post("/api/fichas/status", response_model=FichaStatusResponse)
+def ficha_status(body: FichaRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    visit = active_by_ficha(db, body.ficha_code)
+    return FichaStatusResponse(
+        ficha_code=body.ficha_code,
+        estado="ocupada" if visit else "libre",
+        visit=visit_to_response(visit) if visit else None,
+    )
+
+
+@app.post("/api/visits/ingreso", response_model=VisitResponse, status_code=201)
+def registrar_ingreso(body: IngresoRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    if active_by_ficha(db, body.ficha_code):
+        raise HTTPException(status_code=409, detail="La ficha ya está asociada a un vehículo activo")
+
+    placa_activa = db.scalar(
+        select(ParkingVisit).where(ParkingVisit.placa == body.placa, ParkingVisit.salida_at.is_(None))
+    )
+    if placa_activa:
+        raise HTTPException(status_code=409, detail="La placa ya se encuentra activa en patio")
+
+    ubicacion_activa = db.scalar(
+        select(ParkingVisit).where(ParkingVisit.ubicacion == body.ubicacion, ParkingVisit.salida_at.is_(None))
+    )
+    if ubicacion_activa:
+        raise HTTPException(status_code=409, detail="La ubicación ya está ocupada")
+
+    dock_activo = db.scalar(select(ParkingVisit).where(ParkingVisit.dock == body.dock, ParkingVisit.salida_at.is_(None)))
+    if dock_activo:
+        raise HTTPException(status_code=409, detail="La doka/dock ya está ocupada")
+
+    now = utc_now()
+    visit = ParkingVisit(
+        id=str(uuid.uuid4()),
+        ficha_code=body.ficha_code,
+        placa=body.placa,
+        ruta=body.ruta,
+        cedula=body.cedula,
+        ubicacion=body.ubicacion,
+        dock=body.dock,
+        conductor=body.conductor,
+        observaciones=body.observaciones,
+        ingreso_at=now,
+        operador_ingreso=user.username,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(visit)
+    db.commit()
+    db.refresh(visit)
+    return visit_to_response(visit)
+
+
+@app.post("/api/visits/salida", response_model=VisitResponse)
+def registrar_salida(body: SalidaRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    visit = active_by_ficha(db, body.ficha_code)
+    if not visit:
+        raise HTTPException(status_code=404, detail="No hay vehículo activo asociado a esta ficha")
+
+    now = utc_now()
+    duration = max(0, int(round((now - visit.ingreso_at).total_seconds() / 60)))
+    visit.salida_at = now
+    visit.duracion_min = duration
+    visit.salida_observaciones = body.observaciones
+    visit.operador_salida = user.username
+    visit.updated_at = now
+    db.commit()
+    db.refresh(visit)
+    return visit_to_response(visit)
+
+
+@app.get("/api/visits/active", response_model=list[VisitResponse])
+def active_visits(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    rows = db.scalars(
+        select(ParkingVisit).where(ParkingVisit.salida_at.is_(None)).order_by(ParkingVisit.ingreso_at.desc())
+    ).all()
+    return [visit_to_response(row) for row in rows]
+
+
+@app.get("/api/visits/history", response_model=list[VisitResponse])
+def history(
+    date_filter: Optional[str] = Query(default=None, alias="date", max_length=10, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    from_date: Optional[str] = Query(default=None, max_length=10, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    to_date: Optional[str] = Query(default=None, max_length=10, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    q: Optional[str] = Query(default=None, max_length=40),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    if date_filter:
+        start, end = local_day_bounds(parse_date_str(date_filter))
+    else:
+        today = datetime.now(APP_TZ).date()
+        start_day = parse_date_str(from_date, today)
+        end_day = parse_date_str(to_date, start_day)
+        if end_day < start_day:
+            raise HTTPException(status_code=400, detail="Rango de fechas inválido")
+        start, end = local_range_bounds(start_day, end_day)
+
+    stmt = select(ParkingVisit).where(ParkingVisit.ingreso_at >= start, ParkingVisit.ingreso_at < end)
+    if q:
+        term = f"%{q.strip().upper()}%"
+        stmt = stmt.where(ParkingVisit.placa.like(term))
+    rows = db.scalars(stmt.order_by(ParkingVisit.ingreso_at.desc())).all()
+    return [visit_to_response(row) for row in rows]
+
+
+@app.get("/api/dashboard")
+def dashboard(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    today = datetime.now(APP_TZ).date()
+    start, end = local_day_bounds(today)
+
+    ingresos_hoy = db.scalars(
+        select(ParkingVisit).where(ParkingVisit.ingreso_at >= start, ParkingVisit.ingreso_at < end)
+    ).all()
+    salidas_hoy = db.scalars(
+        select(ParkingVisit).where(ParkingVisit.salida_at >= start, ParkingVisit.salida_at < end)
+    ).all()
+    activos = db.scalars(select(ParkingVisit).where(ParkingVisit.salida_at.is_(None))).all()
+    completados = [row for row in salidas_hoy if row.duracion_min is not None]
+    promedio = round(sum(row.duracion_min for row in completados) / len(completados)) if completados else None
+
+    ultimos_ingresos = db.scalars(select(ParkingVisit).order_by(ParkingVisit.ingreso_at.desc()).limit(8)).all()
+    ultimas_salidas = db.scalars(
+        select(ParkingVisit).where(ParkingVisit.salida_at.is_not(None)).order_by(ParkingVisit.salida_at.desc()).limit(8)
+    ).all()
+
+    return {
+        "fecha": today.isoformat(),
+        "ingresos_hoy": len(ingresos_hoy),
+        "activos": len(activos),
+        "salidas_hoy": len(salidas_hoy),
+        "tiempo_promedio_min": promedio,
+        "tiempo_promedio_formato": format_duration(promedio) if promedio is not None else "–",
+        "ultimos_ingresos": [visit_to_response(row) for row in ultimos_ingresos],
+        "ultimas_salidas": [visit_to_response(row) for row in ultimas_salidas],
+    }
+
+
+@app.get("/api/reports")
+def reports(
+    from_date: Optional[str] = Query(default=None, max_length=10, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    to_date: Optional[str] = Query(default=None, max_length=10, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    today = datetime.now(APP_TZ).date()
+    start_day = parse_date_str(from_date, today - timedelta(days=30))
+    end_day = parse_date_str(to_date, today)
+    if end_day < start_day:
+        raise HTTPException(status_code=400, detail="Rango de fechas inválido")
+    start, end = local_range_bounds(start_day, end_day)
+    completed = db.scalars(
+        select(ParkingVisit).where(
+            ParkingVisit.ingreso_at >= start,
+            ParkingVisit.ingreso_at < end,
+            ParkingVisit.salida_at.is_not(None),
+        )
+    ).all()
+
+    by_plate: dict[str, dict] = {}
+    by_route: dict[str, dict] = {}
+    for row in completed:
+        dur = row.duracion_min or 0
+        plate = by_plate.setdefault(row.placa, {"placa": row.placa, "visitas": 0, "total_min": 0, "max_min": 0})
+        plate["visitas"] += 1
+        plate["total_min"] += dur
+        plate["max_min"] = max(plate["max_min"], dur)
+
+        route = by_route.setdefault(row.ruta, {"ruta": row.ruta, "visitas": 0, "vehiculos": set(), "total_min": 0, "max_min": 0})
+        route["visitas"] += 1
+        route["vehiculos"].add(row.placa)
+        route["total_min"] += dur
+        route["max_min"] = max(route["max_min"], dur)
+
+    plate_rows = []
+    for item in by_plate.values():
+        avg = round(item["total_min"] / item["visitas"]) if item["visitas"] else 0
+        plate_rows.append({**item, "promedio_min": avg, "total_formato": format_duration(item["total_min"]), "promedio_formato": format_duration(avg)})
+    plate_rows.sort(key=lambda x: x["total_min"], reverse=True)
+
+    route_rows = []
+    for item in by_route.values():
+        avg = round(item["total_min"] / item["visitas"]) if item["visitas"] else 0
+        route_rows.append({
+            "ruta": item["ruta"],
+            "visitas": item["visitas"],
+            "vehiculos": len(item["vehiculos"]),
+            "total_min": item["total_min"],
+            "promedio_min": avg,
+            "max_min": item["max_min"],
+            "total_formato": format_duration(item["total_min"]),
+            "promedio_formato": format_duration(avg),
+            "max_formato": format_duration(item["max_min"]),
+        })
+    route_rows.sort(key=lambda x: x["total_min"], reverse=True)
+
+    ranking = sorted(completed, key=lambda row: row.duracion_min or 0, reverse=True)[:50]
+    return {
+        "from_date": start_day.isoformat(),
+        "to_date": end_day.isoformat(),
+        "total_completados": len(completed),
+        "por_vehiculo": plate_rows,
+        "por_ruta": route_rows,
+        "ranking": [visit_to_response(row) for row in ranking],
+    }
+
+
+@app.get("/api/export.csv")
+def export_csv(
+    date_filter: Optional[str] = Query(default=None, alias="date", max_length=10, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    day = parse_date_str(date_filter, datetime.now(APP_TZ).date())
+    start, end = local_day_bounds(day)
+    rows = db.scalars(
+        select(ParkingVisit).where(ParkingVisit.ingreso_at >= start, ParkingVisit.ingreso_at < end).order_by(ParkingVisit.ingreso_at.desc())
+    ).all()
+
+    headers = [
+        "ficha",
+        "placa",
+        "cedula",
+        "ruta",
+        "ubicacion",
+        "doka_dock",
+        "conductor",
+        "fecha_ingreso",
+        "hora_ingreso",
+        "fecha_salida",
+        "hora_salida",
+        "duracion_min",
+        "duracion",
+        "estado",
+        "operador_ingreso",
+        "operador_salida",
+    ]
+    lines = [",".join(headers)]
+    for row in rows:
+        r = visit_to_response(row)
+        values = [
+            r["ficha_code"],
+            r["placa"],
+            r.get("cedula") or "",
+            r["ruta"],
+            r["ubicacion"],
+            r["dock"],
+            r.get("conductor") or "",
+            r["ingreso_fecha"],
+            r["ingreso_hora"],
+            r.get("salida_fecha") or "",
+            r.get("salida_hora") or "",
+            str(r.get("duracion_min") or ""),
+            r["duracion_formato"],
+            r["estado"],
+            r["operador_ingreso"],
+            r.get("operador_salida") or "",
+        ]
+        escaped = [f'"{value.replace(chr(34), chr(34) + chr(34))}"' for value in values]
+        lines.append(",".join(escaped))
+
+    content = "\ufeff" + "\n".join(lines)
+    filename = f"parqueadero_{day.isoformat()}.csv"
+    return StreamingResponse(
+        iter([content]),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.get("/")
+def index():
+    index_file = STATIC_DIR / "index.html"
+    if index_file.exists():
+        return FileResponse(index_file)
+    return Response("Sistema de Parqueadero API", media_type="text/plain")
