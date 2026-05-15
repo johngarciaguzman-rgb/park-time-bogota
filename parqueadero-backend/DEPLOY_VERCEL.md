@@ -38,6 +38,10 @@ OIDC_SCOPES=openid profile email groups
 LOCAL_LOGIN_ENABLED=false
 OIDC_ADMIN_USERS=usuario.admin@empresa.com
 OIDC_ADMIN_GROUPS=
+
+GOOGLE_SHEET_ID=1GG6twSUKAn8LK_t4Q4WK3rMfJsdxRej2FD5pDI9wReU
+GOOGLE_SHEET_NAME=CONTROL ARRIBOS
+GOOGLE_SERVICE_ACCOUNT_JSON_B64=base64_del_json_service_account
 ```
 
 Para pruebas temporales puedes usar:
@@ -100,3 +104,13 @@ Debe mostrar:
 ```
 
 Si `oidc_enabled` sale `false`, falta `OIDC_CLIENT_ID`.
+
+## Acceso a Google Sheets
+
+El documento está privado por defecto. Para producción, crea una **Google Service Account**, comparte el Sheet con su `client_email` y guarda el JSON como `GOOGLE_SERVICE_ACCOUNT_JSON_B64` en Vercel.
+
+Ejemplo local para obtener el base64:
+
+```bash
+base64 -i service-account.json
+```

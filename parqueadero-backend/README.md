@@ -6,19 +6,23 @@ Flujo operativo confirmado: **no se imprime nada**. El conductor recibe una fich
 
 1. El operador inicia sesión con usuario LMS/operador autorizado.
 2. En **Ingreso con ficha**, escanea la ficha física.
-3. Registra placa, ruta, ubicación y doka/dock.
-4. El sistema asocia esa ficha al vehículo y muestra en grande la ubicación para indicársela al conductor.
-5. Si otra persona recibe el vehículo, entra a **Consultar ubicación**, escanea la ficha y el sistema muestra ubicación + doka/dock.
-6. Al salir, el conductor entrega la ficha.
-7. En **Salida con ficha**, el operador escanea la ficha, confirma la salida y la ficha queda libre para reutilizarse.
+3. La app valida la ficha/ruta contra la hoja diaria **CONTROL ARRIBOS** de Google Sheets.
+4. Si la ficha existe, completa ruta, zona/ubicación, MLP, SPR, ola y EST WTD.
+5. Registra placa y cédula.
+6. El sistema asocia esa ficha al vehículo y la descuenta de **PENDIENTES 1 ola**.
+7. Si otra persona recibe el vehículo, escanea la ficha y el sistema muestra ubicación + doka/dock.
+8. Al salir, el conductor entrega la ficha.
+9. En **Salida con ficha**, el operador escanea la ficha, confirma la salida y la ficha queda libre para reutilizarse.
 
 ## Datos que guarda
 
 - Código de ficha
 - Placa
+- Cédula
 - Ruta
 - Ubicación
 - Doka/Dock
+- MLP, SPR y Ola WTD cuando viene de CONTROL ARRIBOS
 - Conductor opcional
 - Observaciones de ingreso/salida
 - Hora de ingreso
@@ -33,6 +37,45 @@ Flujo operativo confirmado: **no se imprime nada**. El conductor recibe una fich
 - Una ubicación activa no puede repetirse.
 - Una doka/dock activa no puede repetirse.
 - La ficha se libera automáticamente al registrar la salida.
+- Una fila de CONTROL ARRIBOS solo aparece en pendientes mientras no tenga ingreso asignado.
+
+## Google Sheets: CONTROL ARRIBOS
+
+La app puede sincronizar la hoja diaria `CONTROL ARRIBOS` del documento:
+
+```text
+1GG6twSUKAn8LK_t4Q4WK3rMfJsdxRej2FD5pDI9wReU
+```
+
+Columnas esperadas:
+
+- `EST WTD`
+- `Ruta Sorting`
+- `MLP`
+- `Zona`
+- `SPR`
+- `Ola WTD`
+- `Disponible` opcional
+
+### Opción recomendada: Service Account
+
+1. Crea una Google Service Account con permiso de lectura a Google Sheets.
+2. Comparte el Google Sheet con el `client_email` de esa service account.
+3. Exporta el JSON de credenciales y pásalo como variable:
+
+```bash
+export GOOGLE_SERVICE_ACCOUNT_JSON_B64="$(base64 -i service-account.json)"
+```
+
+### Opción alternativa: CSV público
+
+Publica únicamente la hoja requerida como CSV y configura:
+
+```bash
+export GOOGLE_PUBLIC_CSV_URL="https://docs.google.com/spreadsheets/d/.../gviz/tq?tqx=out:csv&sheet=CONTROL%20ARRIBOS"
+```
+
+Si la hoja está privada y no hay service account, la app mostrará un error indicando que necesita acceso.
 
 ## Ejecutar localmente
 
@@ -63,6 +106,10 @@ Copiar `.env.example` como referencia:
 - `ADMIN_PASSWORD`: contraseña inicial segura.
 - `DATABASE_URL`: opcional; si no existe, usa SQLite local. En nube se recomienda PostgreSQL.
 - `LOCAL_LOGIN_ENABLED`: `true` para pruebas locales, `false` para obligar login MELI/Okta.
+- `GOOGLE_SHEET_ID`: ID del Google Sheet diario.
+- `GOOGLE_SHEET_NAME`: nombre de hoja; por defecto `CONTROL ARRIBOS`.
+- `GOOGLE_SERVICE_ACCOUNT_JSON_B64`: credenciales de service account en base64.
+- `GOOGLE_PUBLIC_CSV_URL`: alternativa CSV público.
 
 ## Para varios puestos de trabajo
 

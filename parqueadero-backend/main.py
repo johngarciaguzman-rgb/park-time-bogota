@@ -1,4 +1,5 @@
 import base64
+import csv
 import hashlib
 import json
 import os
@@ -7,6 +8,7 @@ import urllib.parse
 import uuid
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta, timezone
+from io import StringIO
 from pathlib import Path
 from typing import Annotated, Generator, Optional
 from zoneinfo import ZoneInfo
@@ -21,7 +23,7 @@ import httpx
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel, Field, StringConstraints, field_validator
-from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text, create_engine, select, text, inspect
+from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text, create_engine, inspect, select, text
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 APP_TZ = ZoneInfo(os.getenv("APP_TIMEZONE", "America/Bogota"))
@@ -45,6 +47,12 @@ OIDC_ADMIN_GROUPS = {
     for value in os.getenv("OIDC_ADMIN_GROUPS", "").split(",")
     if value.strip()
 }
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "1GG6twSUKAn8LK_t4Q4WK3rMfJsdxRej2FD5pDI9wReU").strip()
+GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "CONTROL ARRIBOS").strip()
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+GOOGLE_SERVICE_ACCOUNT_JSON_B64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_B64", "").strip()
+GOOGLE_PUBLIC_CSV_URL = os.getenv("GOOGLE_PUBLIC_CSV_URL", "").strip()
+ALLOWED_GOOGLE_HOSTS = {"docs.google.com", "sheets.googleapis.com"}
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./parqueadero.db")
 if DATABASE_URL.startswith("postgres://"):
@@ -84,6 +92,10 @@ class ParkingVisit(Base):
     ruta = Column(String(120), index=True, nullable=False)
     ubicacion = Column(String(120), index=True, nullable=False)
     dock = Column(String(80), index=True, nullable=False)
+    arrival_slot_id = Column(String(36), index=True, nullable=True)
+    mlp = Column(String(180), index=True, nullable=True)
+    spr = Column(String(40), nullable=True)
+    ola_wtd = Column(String(40), index=True, nullable=True)
     conductor = Column(String(120), nullable=True)
     observaciones = Column(Text, nullable=True)
     salida_observaciones = Column(Text, nullable=True)
@@ -92,6 +104,29 @@ class ParkingVisit(Base):
     duracion_min = Column(Integer, nullable=True)
     operador_ingreso = Column(String(120), nullable=False)
     operador_salida = Column(String(120), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=lambda: utc_now())
+    updated_at = Column(DateTime, nullable=False, default=lambda: utc_now())
+
+
+class ArrivalSlot(Base):
+    __tablename__ = "arrival_slots"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    sheet_id = Column(String(140), index=True, nullable=False)
+    sheet_name = Column(String(140), index=True, nullable=False)
+    source_row = Column(Integer, index=True, nullable=False)
+    source_key = Column(String(220), index=True, nullable=False)
+    est_wtd = Column(String(40), index=True, nullable=False)
+    ruta_sorting = Column(String(80), index=True, nullable=False)
+    mlp = Column(String(180), index=True, nullable=False)
+    zona = Column(String(220), index=True, nullable=False)
+    spr = Column(String(40), nullable=True)
+    ola_wtd = Column(String(40), index=True, nullable=True)
+    disponible = Column(String(80), nullable=True)
+    active = Column(Boolean, nullable=False, default=True)
+    assigned_visit_id = Column(String(36), index=True, nullable=True)
+    assigned_at = Column(DateTime, nullable=True)
+    last_sync_at = Column(DateTime, nullable=False, default=lambda: utc_now())
     created_at = Column(DateTime, nullable=False, default=lambda: utc_now())
     updated_at = Column(DateTime, nullable=False, default=lambda: utc_now())
 
@@ -321,6 +356,7 @@ class IngresoRequest(BaseModel):
     ruta: ShortText
     ubicacion: ShortText
     dock: ShortText
+    arrival_slot_id: Optional[str] = Field(default=None, max_length=36)
     cedula: Optional[Annotated[str, StringConstraints(strip_whitespace=True, max_length=30, pattern=r"^[A-Za-z0-9._-]*$")]] = None
     conductor: Optional[OptionalText] = None
     observaciones: Optional[OptionalText] = None
@@ -343,6 +379,10 @@ class VisitResponse(BaseModel):
     ruta: str
     ubicacion: str
     dock: str
+    arrival_slot_id: Optional[str]
+    mlp: Optional[str]
+    spr: Optional[str]
+    ola_wtd: Optional[str]
     cedula: Optional[str]
     conductor: Optional[str]
     observaciones: Optional[str]
@@ -358,6 +398,34 @@ class VisitResponse(BaseModel):
     estado: str
     operador_ingreso: str
     operador_salida: Optional[str]
+
+
+class ArrivalSlotResponse(BaseModel):
+    id: str
+    est_wtd: str
+    ruta_sorting: str
+    mlp: str
+    zona: str
+    spr: Optional[str]
+    ola_wtd: Optional[str]
+    disponible: Optional[str]
+    pending: bool
+    assigned_visit_id: Optional[str]
+
+
+class ArrivalValidateResponse(BaseModel):
+    status: str
+    message: str
+    matches: list[ArrivalSlotResponse]
+
+
+class SheetSyncResponse(BaseModel):
+    status: str
+    message: str
+    imported: int = 0
+    updated: int = 0
+    deactivated: int = 0
+    source: str
 
 
 class FichaStatusResponse(BaseModel):
@@ -376,6 +444,194 @@ def format_duration(minutes: Optional[int]) -> str:
     return f"{mins}min"
 
 
+def normalize_header(value: str) -> str:
+    return (
+        value.strip()
+        .lower()
+        .replace("á", "a")
+        .replace("é", "e")
+        .replace("í", "i")
+        .replace("ó", "o")
+        .replace("ú", "u")
+        .replace("_", " ")
+    )
+
+
+def normalize_code(value: str) -> str:
+    return value.strip().upper().replace(" ", "")
+
+
+def validate_google_url(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https":
+        raise HTTPException(status_code=400, detail="Solo se permiten URLs HTTPS de Google Sheets")
+    hostname = (parsed.hostname or "").lower()
+    if hostname not in ALLOWED_GOOGLE_HOSTS:
+        raise HTTPException(status_code=400, detail="Dominio no permitido para sincronización")
+    if parsed.username or parsed.password:
+        raise HTTPException(status_code=400, detail="La URL no puede contener credenciales")
+    return url
+
+
+def public_csv_url() -> str:
+    if GOOGLE_PUBLIC_CSV_URL:
+        return validate_google_url(GOOGLE_PUBLIC_CSV_URL)
+    encoded_sheet = urllib.parse.quote(GOOGLE_SHEET_NAME)
+    return (
+        f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/gviz/tq"
+        f"?tqx=out:csv&sheet={encoded_sheet}"
+    )
+
+
+def service_account_info() -> Optional[dict]:
+    raw = GOOGLE_SERVICE_ACCOUNT_JSON
+    if GOOGLE_SERVICE_ACCOUNT_JSON_B64:
+        try:
+            raw = base64.b64decode(GOOGLE_SERVICE_ACCOUNT_JSON_B64).decode("utf-8")
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise HTTPException(status_code=500, detail="Credenciales Google inválidas") from exc
+    if not raw:
+        return None
+    try:
+        info = json.loads(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=500, detail="Credenciales Google inválidas") from exc
+    if not isinstance(info, dict) or info.get("type") != "service_account":
+        raise HTTPException(status_code=500, detail="Credenciales Google inválidas")
+    return info
+
+
+async def fetch_sheet_rows() -> tuple[list[list[str]], str]:
+    info = service_account_info()
+    if info:
+        try:
+            from google.oauth2 import service_account
+            from google.auth.transport.requests import Request as GoogleAuthRequest
+        except ImportError as exc:
+            raise HTTPException(status_code=500, detail="Falta instalar google-auth") from exc
+
+        credentials = service_account.Credentials.from_service_account_info(
+            info,
+            scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
+        )
+        credentials.refresh(GoogleAuthRequest())
+        quoted_range = urllib.parse.quote(f"{GOOGLE_SHEET_NAME}!A:Z", safe="")
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/{quoted_range}"
+        validate_google_url(url)
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=False) as client:
+            response = await client.get(url, headers={"Authorization": f"Bearer {credentials.token}"})
+        if response.status_code == 403:
+            raise HTTPException(status_code=403, detail="La service account no tiene acceso al Google Sheet")
+        if response.status_code >= 400:
+            raise HTTPException(status_code=502, detail="No se pudo leer Google Sheets")
+        data = response.json()
+        values = data.get("values", [])
+        if not isinstance(values, list):
+            raise HTTPException(status_code=502, detail="Respuesta inválida de Google Sheets")
+        return [[str(cell) for cell in row] for row in values], "service_account"
+
+    url = public_csv_url()
+    async with httpx.AsyncClient(timeout=20.0, follow_redirects=False) as client:
+        response = await client.get(url)
+    if response.status_code in {301, 302, 303, 307, 308}:
+        raise HTTPException(
+            status_code=403,
+            detail="La hoja no está pública. Configura una service account o publica/exporta la hoja como CSV.",
+        )
+    if response.status_code in {401, 403}:
+        raise HTTPException(
+            status_code=403,
+            detail="La hoja no está pública. Comparte el Google Sheet con una service account o publica la hoja como CSV.",
+        )
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail="No se pudo leer CSV de Google Sheets")
+    if "text/html" in (response.headers.get("content-type") or "").lower():
+        raise HTTPException(
+            status_code=403,
+            detail="Google devolvió una página HTML, no un CSV. La hoja parece privada o requiere login.",
+        )
+    reader = csv.reader(StringIO(response.text))
+    return [[cell for cell in row] for row in reader], "public_csv"
+
+
+def row_value(row: dict[str, str], *names: str) -> str:
+    for name in names:
+        value = row.get(name)
+        if value is not None:
+            return value.strip()
+    return ""
+
+
+def parse_arrival_rows(rows: list[list[str]]) -> list[dict[str, str | int]]:
+    required = {"est wtd", "ruta sorting", "mlp", "zona"}
+    header_index: Optional[int] = None
+    normalized_headers: list[str] = []
+    for index, raw_row in enumerate(rows[:30]):
+        headers = [normalize_header(str(cell)) for cell in raw_row]
+        if required.issubset(set(headers)):
+            header_index = index
+            normalized_headers = headers
+            break
+    if header_index is None:
+        raise HTTPException(status_code=422, detail="No se encontraron columnas esperadas en CONTROL ARRIBOS")
+
+    parsed: list[dict[str, str | int]] = []
+    for offset, raw_row in enumerate(rows[header_index + 1 :], start=header_index + 2):
+        row_map: dict[str, str] = {}
+        for idx, header in enumerate(normalized_headers):
+            if header:
+                row_map[header] = str(raw_row[idx]).strip() if idx < len(raw_row) else ""
+        est_wtd = row_value(row_map, "est wtd")
+        ruta_sorting = row_value(row_map, "ruta sorting")
+        mlp = row_value(row_map, "mlp")
+        zona = row_value(row_map, "zona")
+        if not any([est_wtd, ruta_sorting, mlp, zona]):
+            continue
+        if not est_wtd or not ruta_sorting or not mlp or not zona:
+            continue
+        parsed.append(
+            {
+                "source_row": offset,
+                "est_wtd": est_wtd[:40],
+                "ruta_sorting": ruta_sorting[:80],
+                "mlp": mlp[:180],
+                "zona": zona[:220],
+                "spr": row_value(row_map, "spr")[:40] or None,
+                "ola_wtd": row_value(row_map, "ola wtd", "ola")[:40] or None,
+                "disponible": row_value(row_map, "disponible")[:80] or None,
+            }
+        )
+    return parsed
+
+
+def slot_to_response(slot: ArrivalSlot) -> dict:
+    return {
+        "id": slot.id,
+        "est_wtd": slot.est_wtd,
+        "ruta_sorting": slot.ruta_sorting,
+        "mlp": slot.mlp,
+        "zona": slot.zona,
+        "spr": slot.spr,
+        "ola_wtd": slot.ola_wtd,
+        "disponible": slot.disponible,
+        "pending": slot.active and not slot.assigned_visit_id,
+        "assigned_visit_id": slot.assigned_visit_id,
+    }
+
+
+def current_arrival_day() -> date:
+    return datetime.now(APP_TZ).date()
+
+
+def arrival_source_prefix(day: Optional[date] = None) -> str:
+    sync_day = day or current_arrival_day()
+    return f"{GOOGLE_SHEET_ID}|{GOOGLE_SHEET_NAME}|{sync_day.isoformat()}|"
+
+
+def arrival_source_key(source_row: int, day: Optional[date] = None) -> str:
+    return f"{arrival_source_prefix(day)}{source_row}"
+
+
 def visit_to_response(visit: ParkingVisit) -> dict:
     ingreso_local = to_local(visit.ingreso_at)
     salida_local = to_local(visit.salida_at)
@@ -389,6 +645,10 @@ def visit_to_response(visit: ParkingVisit) -> dict:
         "cedula": visit.cedula,
         "ubicacion": visit.ubicacion,
         "dock": visit.dock,
+        "arrival_slot_id": visit.arrival_slot_id,
+        "mlp": visit.mlp,
+        "spr": visit.spr,
+        "ola_wtd": visit.ola_wtd,
         "conductor": visit.conductor,
         "observaciones": visit.observaciones,
         "salida_observaciones": visit.salida_observaciones,
@@ -415,16 +675,76 @@ def active_by_ficha(db: Session, ficha_code: str) -> Optional[ParkingVisit]:
     )
 
 
+def pending_arrival_slots(db: Session, day: Optional[date] = None) -> list[ArrivalSlot]:
+    prefix = arrival_source_prefix(day)
+    return db.scalars(
+        select(ArrivalSlot)
+        .where(
+            ArrivalSlot.active.is_(True),
+            ArrivalSlot.assigned_visit_id.is_(None),
+            ArrivalSlot.source_key.like(f"{prefix}%"),
+        )
+        .order_by(ArrivalSlot.mlp.asc(), ArrivalSlot.ruta_sorting.asc(), ArrivalSlot.est_wtd.asc())
+    ).all()
+
+
+def find_pending_arrival_slots(db: Session, code: str, day: Optional[date] = None) -> list[ArrivalSlot]:
+    normalized = normalize_code(code)
+    if not normalized:
+        return []
+    return [
+        slot
+        for slot in pending_arrival_slots(db, day)
+        if normalize_code(slot.est_wtd) == normalized or normalize_code(slot.ruta_sorting) == normalized
+    ]
+
+
+def arrival_slot_for_ingreso(db: Session, body: IngresoRequest) -> Optional[ArrivalSlot]:
+    if body.arrival_slot_id:
+        slot = db.scalar(
+            select(ArrivalSlot).where(
+                ArrivalSlot.id == body.arrival_slot_id,
+                ArrivalSlot.active.is_(True),
+            )
+        )
+        if not slot:
+            raise HTTPException(status_code=404, detail="La ficha de CONTROL ARRIBOS no existe o no está activa")
+        if slot.assigned_visit_id:
+            raise HTTPException(status_code=409, detail="La ficha ya fue asignada desde CONTROL ARRIBOS")
+        return slot
+
+    matches = find_pending_arrival_slots(db, body.ficha_code)
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail="La ficha existe varias veces en CONTROL ARRIBOS; selecciona la ruta correcta antes de guardar",
+        )
+    return None
+
+
 def ensure_schema_columns() -> None:
     """Pequeña migración segura para desarrollo local cuando agregamos campos nuevos."""
     inspector = inspect(engine)
     existing_tables = inspector.get_table_names()
-    if "parking_visits" not in existing_tables:
-        return
-    columns = {column["name"] for column in inspector.get_columns("parking_visits")}
-    if "cedula" not in columns:
-        with engine.begin() as connection:
-            connection.execute(text("ALTER TABLE parking_visits ADD COLUMN cedula VARCHAR(30)"))
+    with engine.begin() as connection:
+        if "parking_visits" in existing_tables:
+            columns = {column["name"] for column in inspector.get_columns("parking_visits")}
+            visit_migrations = {
+                "cedula": "ALTER TABLE parking_visits ADD COLUMN cedula VARCHAR(30)",
+                "arrival_slot_id": "ALTER TABLE parking_visits ADD COLUMN arrival_slot_id VARCHAR(36)",
+                "mlp": "ALTER TABLE parking_visits ADD COLUMN mlp VARCHAR(180)",
+                "spr": "ALTER TABLE parking_visits ADD COLUMN spr VARCHAR(40)",
+                "ola_wtd": "ALTER TABLE parking_visits ADD COLUMN ola_wtd VARCHAR(40)",
+            }
+            for column_name, ddl in visit_migrations.items():
+                if column_name not in columns:
+                    connection.execute(text(ddl))
+        if "arrival_slots" in existing_tables:
+            columns = {column["name"] for column in inspector.get_columns("arrival_slots")}
+            if "disponible" not in columns:
+                connection.execute(text("ALTER TABLE arrival_slots ADD COLUMN disponible VARCHAR(80)"))
 
 
 def seed_admin_user() -> None:
@@ -633,10 +953,123 @@ def ficha_status(body: FichaRequest, db: Session = Depends(get_db), user: User =
     )
 
 
+@app.post("/api/sheets/sync", response_model=SheetSyncResponse)
+async def sync_arrivals(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    rows, source = await fetch_sheet_rows()
+    parsed_rows = parse_arrival_rows(rows)
+    now = utc_now()
+    sync_day = current_arrival_day()
+    seen_keys: set[str] = set()
+    imported = 0
+    updated = 0
+
+    for row in parsed_rows:
+        source_key = arrival_source_key(int(row["source_row"]), sync_day)
+        seen_keys.add(source_key)
+        slot = db.scalar(select(ArrivalSlot).where(ArrivalSlot.source_key == source_key))
+        if slot:
+            updated += 1
+        else:
+            imported += 1
+            slot = ArrivalSlot(
+                id=str(uuid.uuid4()),
+                sheet_id=GOOGLE_SHEET_ID,
+                sheet_name=GOOGLE_SHEET_NAME,
+                source_row=int(row["source_row"]),
+                source_key=source_key,
+                created_at=now,
+            )
+            db.add(slot)
+
+        slot.est_wtd = str(row["est_wtd"])
+        slot.ruta_sorting = str(row["ruta_sorting"])
+        slot.mlp = str(row["mlp"])
+        slot.zona = str(row["zona"])
+        slot.spr = row["spr"] if isinstance(row["spr"], str) else None
+        slot.ola_wtd = row["ola_wtd"] if isinstance(row["ola_wtd"], str) else None
+        slot.disponible = row["disponible"] if isinstance(row["disponible"], str) else None
+        slot.sheet_id = GOOGLE_SHEET_ID
+        slot.sheet_name = GOOGLE_SHEET_NAME
+        slot.source_row = int(row["source_row"])
+        slot.active = True
+        slot.last_sync_at = now
+        slot.updated_at = now
+
+    deactivated = 0
+    prefix = arrival_source_prefix(sync_day)
+    active_slots = db.scalars(
+        select(ArrivalSlot).where(
+            ArrivalSlot.sheet_id == GOOGLE_SHEET_ID,
+            ArrivalSlot.sheet_name == GOOGLE_SHEET_NAME,
+            ArrivalSlot.active.is_(True),
+            ArrivalSlot.source_key.like(f"{prefix}%"),
+        )
+    ).all()
+    for slot in active_slots:
+        if slot.source_key not in seen_keys and not slot.assigned_visit_id:
+            slot.active = False
+            slot.updated_at = now
+            deactivated += 1
+
+    db.commit()
+    return SheetSyncResponse(
+        status="ok",
+        message=f"Sincronización completa: {len(parsed_rows)} filas leídas de {GOOGLE_SHEET_NAME}.",
+        imported=imported,
+        updated=updated,
+        deactivated=deactivated,
+        source=source,
+    )
+
+
+@app.get("/api/arrivals/pending", response_model=list[ArrivalSlotResponse])
+def arrivals_pending(
+    ola: Optional[str] = Query(default="1", max_length=40),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    rows = pending_arrival_slots(db)
+    if ola and ola.strip().lower() not in {"all", "todas", "todos"}:
+        normalized_ola = normalize_code(ola)
+        rows = [row for row in rows if normalize_code(row.ola_wtd or "") == normalized_ola]
+    return [slot_to_response(row) for row in rows]
+
+
+@app.get("/api/arrivals/validate", response_model=ArrivalValidateResponse)
+def validate_arrival(
+    code: str = Query(..., min_length=2, max_length=80, pattern=r"^[A-Za-z0-9._:/ -]+$"),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    matches = find_pending_arrival_slots(db, code)
+    if not matches:
+        return ArrivalValidateResponse(
+            status="not_found",
+            message="No encontré esa ficha/ruta en los pendientes sincronizados de CONTROL ARRIBOS.",
+            matches=[],
+        )
+    if len(matches) == 1:
+        return ArrivalValidateResponse(
+            status="unique",
+            message="Ficha validada. Se asignará esta ruta y saldrá de pendientes al guardar.",
+            matches=[slot_to_response(matches[0])],
+        )
+    return ArrivalValidateResponse(
+        status="multiple",
+        message="La ficha coincide con varias rutas; selecciona una para asignarla.",
+        matches=[slot_to_response(row) for row in matches],
+    )
+
+
 @app.post("/api/visits/ingreso", response_model=VisitResponse, status_code=201)
 def registrar_ingreso(body: IngresoRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     if active_by_ficha(db, body.ficha_code):
         raise HTTPException(status_code=409, detail="La ficha ya está asociada a un vehículo activo")
+
+    arrival_slot = arrival_slot_for_ingreso(db, body)
+    ruta = arrival_slot.ruta_sorting if arrival_slot else body.ruta
+    ubicacion = arrival_slot.zona if arrival_slot else body.ubicacion
+    dock = arrival_slot.est_wtd if arrival_slot else body.dock
 
     placa_activa = db.scalar(
         select(ParkingVisit).where(ParkingVisit.placa == body.placa, ParkingVisit.salida_at.is_(None))
@@ -645,12 +1078,14 @@ def registrar_ingreso(body: IngresoRequest, db: Session = Depends(get_db), user:
         raise HTTPException(status_code=409, detail="La placa ya se encuentra activa en patio")
 
     ubicacion_activa = db.scalar(
-        select(ParkingVisit).where(ParkingVisit.ubicacion == body.ubicacion, ParkingVisit.salida_at.is_(None))
+        select(ParkingVisit).where(ParkingVisit.ubicacion == ubicacion, ParkingVisit.salida_at.is_(None))
     )
     if ubicacion_activa:
         raise HTTPException(status_code=409, detail="La ubicación ya está ocupada")
 
-    dock_activo = db.scalar(select(ParkingVisit).where(ParkingVisit.dock == body.dock, ParkingVisit.salida_at.is_(None)))
+    dock_activo = None
+    if not arrival_slot:
+        dock_activo = db.scalar(select(ParkingVisit).where(ParkingVisit.dock == dock, ParkingVisit.salida_at.is_(None)))
     if dock_activo:
         raise HTTPException(status_code=409, detail="La doka/dock ya está ocupada")
 
@@ -659,10 +1094,14 @@ def registrar_ingreso(body: IngresoRequest, db: Session = Depends(get_db), user:
         id=str(uuid.uuid4()),
         ficha_code=body.ficha_code,
         placa=body.placa,
-        ruta=body.ruta,
+        ruta=ruta,
         cedula=body.cedula,
-        ubicacion=body.ubicacion,
-        dock=body.dock,
+        ubicacion=ubicacion,
+        dock=dock,
+        arrival_slot_id=arrival_slot.id if arrival_slot else None,
+        mlp=arrival_slot.mlp if arrival_slot else None,
+        spr=arrival_slot.spr if arrival_slot else None,
+        ola_wtd=arrival_slot.ola_wtd if arrival_slot else None,
         conductor=body.conductor,
         observaciones=body.observaciones,
         ingreso_at=now,
@@ -671,6 +1110,10 @@ def registrar_ingreso(body: IngresoRequest, db: Session = Depends(get_db), user:
         updated_at=now,
     )
     db.add(visit)
+    if arrival_slot:
+        arrival_slot.assigned_visit_id = visit.id
+        arrival_slot.assigned_at = now
+        arrival_slot.updated_at = now
     db.commit()
     db.refresh(visit)
     return visit_to_response(visit)
@@ -849,6 +1292,9 @@ def export_csv(
         "ruta",
         "ubicacion",
         "doka_dock",
+        "mlp",
+        "spr",
+        "ola_wtd",
         "conductor",
         "fecha_ingreso",
         "hora_ingreso",
@@ -870,6 +1316,9 @@ def export_csv(
             r["ruta"],
             r["ubicacion"],
             r["dock"],
+            r.get("mlp") or "",
+            r.get("spr") or "",
+            r.get("ola_wtd") or "",
             r.get("conductor") or "",
             r["ingreso_fecha"],
             r["ingreso_hora"],
