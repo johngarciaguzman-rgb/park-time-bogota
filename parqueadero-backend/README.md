@@ -122,6 +122,9 @@ Copiar `.env.example` como referencia:
 - `ADMIN_PASSWORD`: contraseña inicial segura.
 - `DATABASE_URL`: opcional; si no existe, usa SQLite local. En nube se recomienda PostgreSQL.
 - `LOCAL_LOGIN_ENABLED`: `true` para pruebas locales, `false` para obligar login MELI/Okta.
+- `APP_ROLE_DEFAULT_PASSWORD`: clave única opcional para crear usuarios iniciales por rol.
+- `APP_ROLE_PASSWORDS_JSON`: claves por rol en formato JSON, recomendado si cada rol tendrá una clave diferente.
+- `APP_ROLE_USERNAMES_JSON`: usernames por rol si quieres usar usuarios corporativos específicos.
 - `GOOGLE_SHEET_ID`: ID del Google Sheet diario.
 - `GOOGLE_SHEET_NAME`: nombre de hoja; por defecto `CONTROL ARRIBOS`.
 - `GOOGLE_FLASH_SHEET_NAME`: hoja de bitácora de movimientos; por defecto `Flash_Parking`.
@@ -149,5 +152,18 @@ Configuración requerida:
 ```text
 http://127.0.0.1:8000/api/auth/oidc/callback
 ```
+
+## Menú por rol estilo AppSheet
+
+La pantalla inicial permite seleccionar rol y escribir la **Clave**. Cada rol se autentica contra un usuario local/semilla:
+
+- `Conductor` → `conductor@park.local`
+- `Coordinador MLP` → `coordinador.mlp@park.local`
+- `Operación MELI` → `operacion.meli@park.local`
+- `Operador Estacionamiento` → `operador.estacionamiento@park.local`
+- `Monitor MLP` → `monitor.mlp@park.local`
+- `Torre de Control` → `torre.control@park.local`
+
+Para crearlos automáticamente, configura una clave por entorno con `APP_ROLE_DEFAULT_PASSWORD` o usa `APP_ROLE_PASSWORDS_JSON`. No dejes claves reales escritas en el código ni en el repositorio.
 
 Mientras no exista `OIDC_CLIENT_ID`, el botón MELI queda deshabilitado y se puede usar el login local de desarrollo. En producción se recomienda `LOCAL_LOGIN_ENABLED=false` para que el acceso sea solo corporativo, igual que una app protegida por AppSheet.

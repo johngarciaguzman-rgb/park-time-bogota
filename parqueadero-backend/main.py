@@ -47,6 +47,15 @@ OIDC_ADMIN_GROUPS = {
     for value in os.getenv("OIDC_ADMIN_GROUPS", "").split(",")
     if value.strip()
 }
+APP_ROLE_USERNAMES_DEFAULT = {
+    "Conductor": "conductor@park.local",
+    "Coordinador MLP": "coordinador.mlp@park.local",
+    "Operación MELI": "operacion.meli@park.local",
+    "Operador Estacionamiento": "operador.estacionamiento@park.local",
+    "Monitor MLP": "monitor.mlp@park.local",
+    "Torre de Control": "torre.control@park.local",
+}
+APP_ROLE_ADMIN_NAMES = {"Operación MELI", "Torre de Control"}
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "1GG6twSUKAn8LK_t4Q4WK3rMfJsdxRej2FD5pDI9wReU").strip()
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "CONTROL ARRIBOS").strip()
 GOOGLE_FLASH_SHEET_NAME = os.getenv("GOOGLE_FLASH_SHEET_NAME", "Flash_Parking").strip()
@@ -203,6 +212,42 @@ def hash_password(password: str) -> str:
     return pwd_context.hash(password)
 
 
+def configured_role_usernames() -> dict[str, str]:
+    mapping = dict(APP_ROLE_USERNAMES_DEFAULT)
+    raw = os.getenv("APP_ROLE_USERNAMES_JSON", "").strip()
+    if not raw:
+        return mapping
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return mapping
+    if not isinstance(parsed, dict):
+        return mapping
+    for role_name, username in parsed.items():
+        if role_name in APP_ROLE_USERNAMES_DEFAULT and isinstance(username, str):
+            candidate = username.strip()
+            if 3 <= len(candidate) <= 120 and all(char.isalnum() or char in "@._-" for char in candidate):
+                mapping[role_name] = candidate
+    return mapping
+
+
+def configured_role_passwords() -> dict[str, str]:
+    raw = os.getenv("APP_ROLE_PASSWORDS_JSON", "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    passwords: dict[str, str] = {}
+    for role_name, password in parsed.items():
+        if role_name in APP_ROLE_USERNAMES_DEFAULT and isinstance(password, str) and password:
+            passwords[role_name] = password[:128]
+    return passwords
+
+
 def normalize_placa(value: str) -> str:
     return value.strip().upper().replace(" ", "")
 
@@ -336,6 +381,11 @@ Role = Annotated[str, StringConstraints(strip_whitespace=True, pattern=r"^(admin
 class LoginRequest(BaseModel):
     username: Username
     password: LoginPassword
+
+
+class RoleLoginRequest(BaseModel):
+    role: ShortText
+    clave: LoginPassword
 
 
 class TokenResponse(BaseModel):
@@ -947,11 +997,32 @@ def seed_admin_user() -> None:
         db.commit()
 
 
+def seed_role_users() -> None:
+    """Create role users only when passwords are provided through environment variables."""
+    default_password = os.getenv("APP_ROLE_DEFAULT_PASSWORD", "")
+    per_role_passwords = configured_role_passwords()
+    if not default_password and not per_role_passwords:
+        return
+
+    with SessionLocal() as db:
+        for app_role, username in configured_role_usernames().items():
+            password = per_role_passwords.get(app_role) or default_password
+            if not password:
+                continue
+            existing = db.scalar(select(User).where(User.username == username))
+            if existing:
+                continue
+            system_role = "admin" if app_role in APP_ROLE_ADMIN_NAMES else "operador"
+            db.add(User(username=username, password_hash=hash_password(password), role=system_role, active=True))
+        db.commit()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
     ensure_schema_columns()
     seed_admin_user()
+    seed_role_users()
     yield
 
 
@@ -975,6 +1046,19 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
     user = db.scalar(select(User).where(User.username == body.username, User.active.is_(True)))
     if not user or not verify_password(body.password, user.password_hash):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Usuario o contraseña inválidos")
+    token = create_access_token(user.username, user.role)
+    return TokenResponse(access_token=token, username=user.username, role=user.role)
+
+
+@app.post("/api/auth/role-login", response_model=TokenResponse)
+def role_login(body: RoleLoginRequest, db: Session = Depends(get_db)):
+    role_name = body.role.strip()
+    username = configured_role_usernames().get(role_name)
+    if not username:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Rol o clave inválidos")
+    user = db.scalar(select(User).where(User.username == username, User.active.is_(True)))
+    if not user or not verify_password(body.clave, user.password_hash):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Rol o clave inválidos")
     token = create_access_token(user.username, user.role)
     return TokenResponse(access_token=token, username=user.username, role=user.role)
 

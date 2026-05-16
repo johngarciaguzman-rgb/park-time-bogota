@@ -39,6 +39,10 @@ LOCAL_LOGIN_ENABLED=false
 OIDC_ADMIN_USERS=usuario.admin@empresa.com
 OIDC_ADMIN_GROUPS=
 
+APP_ROLE_DEFAULT_PASSWORD=clave_segura_para_roles
+# O, si cada rol tiene clave diferente:
+# APP_ROLE_PASSWORDS_JSON={"Conductor":"...","Coordinador MLP":"...","Operación MELI":"..."}
+
 GOOGLE_SHEET_ID=1GG6twSUKAn8LK_t4Q4WK3rMfJsdxRej2FD5pDI9wReU
 GOOGLE_SHEET_NAME=CONTROL ARRIBOS
 GOOGLE_FLASH_SHEET_NAME=Flash_Parking
