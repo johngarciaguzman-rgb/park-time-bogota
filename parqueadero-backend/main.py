@@ -65,8 +65,10 @@ GOOGLE_FLASH_SHEET_NAME = os.getenv("GOOGLE_FLASH_SHEET_NAME", "Flash_Parking").
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 GOOGLE_SERVICE_ACCOUNT_JSON_B64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_B64", "").strip()
 GOOGLE_PUBLIC_CSV_URL = os.getenv("GOOGLE_PUBLIC_CSV_URL", "").strip()
+GOOGLE_FLASH_WEBHOOK_URL = os.getenv("GOOGLE_FLASH_WEBHOOK_URL", "").strip()
+GOOGLE_FLASH_WEBHOOK_SECRET = os.getenv("GOOGLE_FLASH_WEBHOOK_SECRET", "").strip()
 GOOGLE_FLASH_LOG_REQUIRED = os.getenv("GOOGLE_FLASH_LOG_REQUIRED", "false").strip().lower() in {"1", "true", "yes", "on"}
-ALLOWED_GOOGLE_HOSTS = {"docs.google.com", "sheets.googleapis.com"}
+ALLOWED_GOOGLE_HOSTS = {"docs.google.com", "sheets.googleapis.com", "script.google.com", "script.googleusercontent.com"}
 DEFAULT_MODULE_ROLE_ACCESS = {
     "flash": ["Conductor", "Coordinador MLP", "Operación MELI", "Operador Estacionamiento"],
     "tiempos": ["Coordinador MLP", "Operación MELI", "Monitor MLP"],
@@ -979,6 +981,65 @@ def flash_assigned_dock(visit: ParkingVisit, lector_qr: Optional[str]) -> str:
     return visit.dock
 
 
+def flash_parking_payload(
+    *,
+    row_id: str,
+    recorded_at: datetime,
+    ciclo: str,
+    device_id: Optional[str],
+    lector_qr: str,
+    estacionamiento_asignado: str,
+    movement_type: str,
+) -> dict:
+    local_dt = to_local(recorded_at) or datetime.now(APP_TZ)
+    return {
+        "id": row_id,
+        "fecha": local_dt.strftime("%d/%m/%Y"),
+        "ciclo": ciclo,
+        "dispositivo": (device_id or "").strip() or "web",
+        "lector_qr": lector_qr.strip(),
+        "estacionamiento_asignado": estacionamiento_asignado,
+        "tipo_movimiento": movement_type,
+        "hora_registro": local_dt.strftime("%H:%M:%S"),
+    }
+
+
+def append_flash_parking_webhook(payload: dict, required: bool = False) -> bool:
+    if not GOOGLE_FLASH_WEBHOOK_URL:
+        if required:
+            raise HTTPException(status_code=503, detail="Falta configurar GOOGLE_FLASH_WEBHOOK_URL")
+        return False
+    if not GOOGLE_FLASH_WEBHOOK_SECRET:
+        if required:
+            raise HTTPException(status_code=503, detail="Falta configurar GOOGLE_FLASH_WEBHOOK_SECRET")
+        return False
+
+    url = validate_google_url(GOOGLE_FLASH_WEBHOOK_URL)
+    try:
+        with httpx.Client(timeout=20.0, follow_redirects=False) as client:
+            response = client.post(
+                url,
+                json={"token": GOOGLE_FLASH_WEBHOOK_SECRET, "row": payload},
+            )
+        if response.status_code >= 400:
+            raise HTTPException(status_code=502, detail="No se pudo escribir vía Apps Script")
+        try:
+            data = response.json()
+        except ValueError:
+            data = {}
+        if isinstance(data, dict) and data.get("ok") is False:
+            raise HTTPException(status_code=502, detail="Apps Script rechazó el registro")
+        return True
+    except HTTPException:
+        if required or GOOGLE_FLASH_LOG_REQUIRED:
+            raise
+        return False
+    except Exception as exc:
+        if required or GOOGLE_FLASH_LOG_REQUIRED:
+            raise HTTPException(status_code=502, detail="No se pudo escribir vía Apps Script") from exc
+        return False
+
+
 def append_flash_parking_row(
     *,
     row_id: str,
@@ -990,15 +1051,19 @@ def append_flash_parking_row(
     movement_type: str,
     required: bool = False,
 ) -> bool:
+    payload = flash_parking_payload(
+        row_id=row_id,
+        recorded_at=recorded_at,
+        ciclo=ciclo,
+        device_id=device_id,
+        lector_qr=lector_qr,
+        estacionamiento_asignado=estacionamiento_asignado,
+        movement_type=movement_type,
+    )
     try:
         info = service_account_info()
         if not info:
-            if required:
-                raise HTTPException(
-                    status_code=503,
-                    detail="Falta configurar una service account con permiso Editor para escribir en Flash_Parking",
-                )
-            return False
+            return append_flash_parking_webhook(payload, required=required)
 
         try:
             from google.oauth2 import service_account
@@ -1012,17 +1077,16 @@ def append_flash_parking_row(
         )
         credentials.refresh(GoogleAuthRequest())
 
-        local_dt = to_local(recorded_at) or datetime.now(APP_TZ)
         values = [
             [
-                row_id,
-                local_dt.strftime("%d/%m/%Y"),
-                ciclo,
-                (device_id or "").strip() or "web",
-                lector_qr.strip(),
-                estacionamiento_asignado,
-                movement_type,
-                local_dt.strftime("%H:%M:%S"),
+                payload["id"],
+                payload["fecha"],
+                payload["ciclo"],
+                payload["dispositivo"],
+                payload["lector_qr"],
+                payload["estacionamiento_asignado"],
+                payload["tipo_movimiento"],
+                payload["hora_registro"],
             ]
         ]
         quoted_range = urllib.parse.quote(f"{GOOGLE_FLASH_SHEET_NAME}!A:H", safe="")

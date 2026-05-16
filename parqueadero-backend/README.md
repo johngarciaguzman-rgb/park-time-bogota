@@ -137,6 +137,8 @@ Copiar `.env.example` como referencia:
 - `GOOGLE_SHEET_NAME`: nombre de hoja; por defecto `CONTROL ARRIBOS`.
 - `GOOGLE_ROLES_SHEET_NAME`: hoja de roles/módulos; por defecto `Lista_Roles`.
 - `GOOGLE_FLASH_SHEET_NAME`: hoja de bitácora de movimientos; por defecto `Flash_Parking`.
+- `GOOGLE_FLASH_WEBHOOK_URL`: URL de Google Apps Script para escribir `Flash_Parking` sin service account.
+- `GOOGLE_FLASH_WEBHOOK_SECRET`: token secreto compartido con el Apps Script.
 - `GOOGLE_FLASH_LOG_REQUIRED`: `true` si quieres bloquear ingresos/salidas cuando no se pueda escribir en `Flash_Parking`.
 - `GOOGLE_SERVICE_ACCOUNT_JSON_B64`: credenciales de service account en base64.
 - `GOOGLE_PUBLIC_CSV_URL`: alternativa CSV público.
