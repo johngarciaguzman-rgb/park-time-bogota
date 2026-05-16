@@ -3,6 +3,7 @@ import csv
 import hashlib
 import json
 import os
+import re
 import secrets
 import urllib.parse
 import uuid
@@ -55,15 +56,49 @@ APP_ROLE_USERNAMES_DEFAULT = {
     "Monitor MLP": "monitor.mlp@park.local",
     "Torre de Control": "torre.control@park.local",
 }
+APP_VISIBLE_ROLES_DEFAULT = ["Conductor", "Coordinador MLP", "Operación MELI"]
 APP_ROLE_ADMIN_NAMES = {"Operación MELI", "Torre de Control"}
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "1UM29RveA97jOkbKFifBNDhRsD4GTlltD2DHyF1xwMLA").strip()
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "CONTROL ARRIBOS").strip()
+GOOGLE_ROLES_SHEET_NAME = os.getenv("GOOGLE_ROLES_SHEET_NAME", "Lista_Roles").strip()
 GOOGLE_FLASH_SHEET_NAME = os.getenv("GOOGLE_FLASH_SHEET_NAME", "Flash_Parking").strip()
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 GOOGLE_SERVICE_ACCOUNT_JSON_B64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_B64", "").strip()
 GOOGLE_PUBLIC_CSV_URL = os.getenv("GOOGLE_PUBLIC_CSV_URL", "").strip()
 GOOGLE_FLASH_LOG_REQUIRED = os.getenv("GOOGLE_FLASH_LOG_REQUIRED", "false").strip().lower() in {"1", "true", "yes", "on"}
 ALLOWED_GOOGLE_HOSTS = {"docs.google.com", "sheets.googleapis.com"}
+DEFAULT_MODULE_ROLE_ACCESS = {
+    "flash": ["Conductor", "Coordinador MLP", "Operación MELI", "Operador Estacionamiento"],
+    "tiempos": ["Coordinador MLP", "Operación MELI", "Monitor MLP"],
+    "arribos": ["Coordinador MLP", "Operación MELI", "Monitor MLP"],
+}
+MODULE_ALIASES = {
+    "estacionamiento": "est",
+    "parqueadero": "est",
+    "parking": "est",
+    "flash parking": "flash",
+    "movimiento flash": "flash",
+    "ingreso salida": "flash",
+    "ingreso y salida": "flash",
+    "monitor de tiempo": "tiempos",
+    "monitor de tiempos": "tiempos",
+    "monitoreo de tiempo": "tiempos",
+    "monitoreo de tiempos": "tiempos",
+    "tiempos": "tiempos",
+    "monitor de arribos": "arribos",
+    "monitoreo de arribos": "arribos",
+    "arribos": "arribos",
+    "reporte mlp": "reporte",
+    "pendientes": "reporte",
+    "mapa de docas": "mapa",
+    "mapa docas": "mapa",
+    "docas": "mapa",
+    "torre de control": "torre",
+    "torre": "torre",
+    "dashboard": "dash",
+    "dashboard reportes": "dash",
+    "reportes": "dash",
+}
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./parqueadero.db")
 if DATABASE_URL.startswith("postgres://"):
@@ -246,6 +281,211 @@ def configured_role_passwords() -> dict[str, str]:
         if role_name in APP_ROLE_USERNAMES_DEFAULT and isinstance(password, str) and password:
             passwords[role_name] = password[:128]
     return passwords
+
+
+def default_modules_by_role() -> dict[str, list[str]]:
+    modules_by_role: dict[str, list[str]] = {role_name: [] for role_name in APP_ROLE_USERNAMES_DEFAULT}
+    for module_id, role_names in DEFAULT_MODULE_ROLE_ACCESS.items():
+        for role_name in role_names:
+            modules_by_role.setdefault(role_name, []).append(module_id)
+    return modules_by_role
+
+
+def default_role_catalog() -> dict:
+    configured_usernames = configured_role_usernames()
+    role_names = [role for role in APP_VISIBLE_ROLES_DEFAULT if role in configured_usernames]
+    modules = default_modules_by_role()
+    return {
+        "roles": role_names,
+        "modules_by_role": {role: modules.get(role, []) for role in role_names},
+        "usernames": {role: configured_usernames[role] for role in role_names},
+        "passwords": configured_role_passwords(),
+        "admin_roles": sorted(APP_ROLE_ADMIN_NAMES),
+        "source": "default",
+        "sheet_name": GOOGLE_ROLES_SHEET_NAME,
+    }
+
+
+def clean_sheet_text(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def is_truthy_sheet_value(value: str) -> bool:
+    return normalize_header(value) in {"1", "true", "si", "sí", "yes", "y", "x", "ok", "activo", "active", "habilitado"}
+
+
+def is_falsey_sheet_value(value: str) -> bool:
+    return normalize_header(value) in {"0", "false", "no", "n", "inactivo", "inactive", "deshabilitado", "disabled"}
+
+
+def module_id_from_text(value: str) -> Optional[str]:
+    normalized = normalize_header(value)
+    if not normalized:
+        return None
+    if normalized in MODULE_ALIASES:
+        return MODULE_ALIASES[normalized]
+    for alias, module_id in MODULE_ALIASES.items():
+        if alias in normalized:
+            return module_id
+    return None
+
+
+def module_ids_from_text(value: str) -> list[str]:
+    module_ids: list[str] = []
+    for chunk in re.split(r"[\n,;|]+", str(value or "")):
+        module_id = module_id_from_text(chunk)
+        if module_id and module_id not in module_ids:
+            module_ids.append(module_id)
+    if not module_ids:
+        module_id = module_id_from_text(value)
+        if module_id:
+            module_ids.append(module_id)
+    return module_ids
+
+
+def slug_role_username(role_name: str) -> str:
+    slug = re.sub(r"[^a-z0-9._-]+", ".", normalize_header(role_name))
+    slug = slug.strip(".-_") or "rol"
+    return f"{slug}@park.local"
+
+
+def row_map_from_headers(headers: list[str], raw_row: list[str]) -> dict[str, str]:
+    row_map: dict[str, str] = {}
+    for idx, header in enumerate(headers):
+        if header:
+            row_map[header] = clean_sheet_text(raw_row[idx]) if idx < len(raw_row) else ""
+    return row_map
+
+
+def first_header(headers: list[str], aliases: set[str]) -> Optional[str]:
+    for header in headers:
+        if header in aliases:
+            return header
+    return None
+
+
+def parse_roles_rows(rows: list[list[str]]) -> dict:
+    fallback = default_role_catalog()
+    header_index: Optional[int] = None
+    normalized_headers: list[str] = []
+    role_aliases = {"rol", "role", "perfil"}
+    module_aliases = {"modulo", "modulos", "módulo", "módulos", "modulo app", "modulos app", "menu", "vista", "acceso"}
+
+    for index, raw_row in enumerate(rows[:30]):
+        headers = [normalize_header(str(cell)) for cell in raw_row]
+        if set(headers) & (role_aliases | module_aliases):
+            header_index = index
+            normalized_headers = headers
+            break
+
+    if header_index is None:
+        return fallback
+
+    role_header = first_header(normalized_headers, role_aliases)
+    module_header = first_header(normalized_headers, module_aliases)
+    username_header = first_header(normalized_headers, {"usuario", "username", "user", "correo", "email"})
+    password_header = first_header(normalized_headers, {"clave", "password", "contrasena", "contraseña"})
+    active_header = first_header(normalized_headers, {"activo", "active", "habilitado", "enabled", "estado"})
+    admin_header = first_header(normalized_headers, {"admin", "administrador", "sistema", "system role", "rol sistema", "tipo"})
+
+    roles: list[str] = []
+    usernames: dict[str, str] = dict(fallback["usernames"])
+    passwords: dict[str, str] = dict(fallback["passwords"])
+    modules_by_role: dict[str, list[str]] = {}
+    admin_roles = set(APP_ROLE_ADMIN_NAMES)
+
+    if role_header:
+        for raw_row in rows[header_index + 1 :]:
+            row_map = row_map_from_headers(normalized_headers, raw_row)
+            if active_header and is_falsey_sheet_value(row_map.get(active_header, "")):
+                continue
+            role_name = clean_sheet_text(row_map.get(role_header, ""))
+            if not role_name or len(role_name) > 80:
+                continue
+            if role_name not in roles:
+                roles.append(role_name)
+
+            username = clean_sheet_text(row_map.get(username_header or "", ""))
+            if username and 3 <= len(username) <= 120 and all(char.isalnum() or char in "@._-" for char in username):
+                usernames[role_name] = username
+            else:
+                usernames.setdefault(role_name, slug_role_username(role_name))
+
+            password = row_map.get(password_header or "", "")
+            if password:
+                passwords[role_name] = password[:128]
+
+            if admin_header:
+                admin_value = row_map.get(admin_header, "")
+                if is_truthy_sheet_value(admin_value) or normalize_header(admin_value) == "admin":
+                    admin_roles.add(role_name)
+
+            module_ids = module_ids_from_text(row_map.get(module_header or "", ""))
+            if module_ids:
+                existing = modules_by_role.setdefault(role_name, [])
+                for module_id in module_ids:
+                    if module_id not in existing:
+                        existing.append(module_id)
+
+    elif module_header:
+        # Matrix format: first column is module and role names are column headers.
+        role_columns = [
+            header
+            for header in normalized_headers
+            if header and header != module_header and header not in {"clave", "password", "activo", "active"}
+        ]
+        role_display_names = {
+            normalize_header(default_role): default_role for default_role in APP_ROLE_USERNAMES_DEFAULT
+        }
+        for role_column in role_columns:
+            role_name = role_display_names.get(role_column, clean_sheet_text(role_column).title())
+            if role_name not in roles:
+                roles.append(role_name)
+                usernames.setdefault(role_name, slug_role_username(role_name))
+        for raw_row in rows[header_index + 1 :]:
+            row_map = row_map_from_headers(normalized_headers, raw_row)
+            module_ids = module_ids_from_text(row_map.get(module_header, ""))
+            if not module_ids:
+                continue
+            for role_column in role_columns:
+                if not is_truthy_sheet_value(row_map.get(role_column, "")):
+                    continue
+                role_name = role_display_names.get(role_column, clean_sheet_text(role_column).title())
+                existing = modules_by_role.setdefault(role_name, [])
+                for module_id in module_ids:
+                    if module_id not in existing:
+                        existing.append(module_id)
+
+    if not roles:
+        return fallback
+
+    fallback_modules = fallback["modules_by_role"]
+    for role_name in roles:
+        modules_by_role.setdefault(role_name, fallback_modules.get(role_name, []))
+        usernames.setdefault(role_name, fallback["usernames"].get(role_name, slug_role_username(role_name)))
+
+    return {
+        "roles": roles,
+        "modules_by_role": {role: modules_by_role.get(role, []) for role in roles},
+        "usernames": {role: usernames[role] for role in roles if role in usernames},
+        "passwords": {role: passwords[role] for role in roles if role in passwords},
+        "admin_roles": sorted(admin_roles),
+        "source": "google_sheet",
+        "sheet_name": GOOGLE_ROLES_SHEET_NAME,
+    }
+
+
+async def role_catalog_from_sheet() -> dict:
+    try:
+        rows, source = await fetch_sheet_rows(GOOGLE_ROLES_SHEET_NAME)
+        catalog = parse_roles_rows(rows)
+        if catalog.get("source") == "google_sheet":
+            catalog["source"] = f"google_sheet:{source}"
+        return catalog
+    except HTTPException:
+        return default_role_catalog()
+    except Exception:
+        return default_role_catalog()
 
 
 def normalize_placa(value: str) -> str:
@@ -608,10 +848,10 @@ def validate_google_url(url: str) -> str:
     return url
 
 
-def public_csv_url() -> str:
-    if GOOGLE_PUBLIC_CSV_URL:
+def public_csv_url(sheet_name: str = GOOGLE_SHEET_NAME) -> str:
+    if GOOGLE_PUBLIC_CSV_URL and sheet_name == GOOGLE_SHEET_NAME:
         return validate_google_url(GOOGLE_PUBLIC_CSV_URL)
-    encoded_sheet = urllib.parse.quote(GOOGLE_SHEET_NAME)
+    encoded_sheet = urllib.parse.quote(sheet_name)
     return (
         f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/gviz/tq"
         f"?tqx=out:csv&sheet={encoded_sheet}"
@@ -636,7 +876,8 @@ def service_account_info() -> Optional[dict]:
     return info
 
 
-async def fetch_sheet_rows() -> tuple[list[list[str]], str]:
+async def fetch_sheet_rows(sheet_name: str = GOOGLE_SHEET_NAME) -> tuple[list[list[str]], str]:
+    sheet_name = clean_sheet_text(sheet_name) or GOOGLE_SHEET_NAME
     info = service_account_info()
     if info:
         try:
@@ -650,7 +891,7 @@ async def fetch_sheet_rows() -> tuple[list[list[str]], str]:
             scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
         )
         credentials.refresh(GoogleAuthRequest())
-        quoted_range = urllib.parse.quote(f"{GOOGLE_SHEET_NAME}!A:Z", safe="")
+        quoted_range = urllib.parse.quote(f"{sheet_name}!A:Z", safe="")
         url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/{quoted_range}"
         validate_google_url(url)
         async with httpx.AsyncClient(timeout=20.0, follow_redirects=False) as client:
@@ -665,7 +906,7 @@ async def fetch_sheet_rows() -> tuple[list[list[str]], str]:
             raise HTTPException(status_code=502, detail="Respuesta inválida de Google Sheets")
         return [[str(cell) for cell in row] for row in values], "service_account"
 
-    url = public_csv_url()
+    url = public_csv_url(sheet_name)
     async with httpx.AsyncClient(timeout=20.0, follow_redirects=False) as client:
         response = await client.get(url)
     if response.status_code in {301, 302, 303, 307, 308}:
@@ -1127,9 +1368,10 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
 
 
 @app.post("/api/auth/role-login", response_model=TokenResponse)
-def role_login(body: RoleLoginRequest, db: Session = Depends(get_db)):
+async def role_login(body: RoleLoginRequest, db: Session = Depends(get_db)):
     role_name = body.role.strip()
-    username = configured_role_usernames().get(role_name)
+    catalog = await role_catalog_from_sheet()
+    username = catalog.get("usernames", {}).get(role_name) or configured_role_usernames().get(role_name)
     if not username:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Rol o clave inválidos")
     user = db.scalar(select(User).where(User.username == username, User.active.is_(True)))
@@ -1137,6 +1379,18 @@ def role_login(body: RoleLoginRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Rol o clave inválidos")
     token = create_access_token(user.username, user.role)
     return TokenResponse(access_token=token, username=user.username, role=user.role)
+
+
+@app.get("/api/app/roles")
+async def app_roles():
+    catalog = await role_catalog_from_sheet()
+    return {
+        "roles": catalog["roles"],
+        "modules_by_role": catalog["modules_by_role"],
+        "source": catalog["source"],
+        "sheet_name": catalog["sheet_name"],
+        "enabled_modules": list(DEFAULT_MODULE_ROLE_ACCESS.keys()),
+    }
 
 
 @app.get("/api/auth/settings")

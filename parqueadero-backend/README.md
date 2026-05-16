@@ -135,6 +135,7 @@ Copiar `.env.example` como referencia:
 - `APP_ROLE_USERNAMES_JSON`: usernames por rol si quieres usar usuarios corporativos específicos.
 - `GOOGLE_SHEET_ID`: ID del Google Sheet diario.
 - `GOOGLE_SHEET_NAME`: nombre de hoja; por defecto `CONTROL ARRIBOS`.
+- `GOOGLE_ROLES_SHEET_NAME`: hoja de roles/módulos; por defecto `Lista_Roles`.
 - `GOOGLE_FLASH_SHEET_NAME`: hoja de bitácora de movimientos; por defecto `Flash_Parking`.
 - `GOOGLE_FLASH_LOG_REQUIRED`: `true` si quieres bloquear ingresos/salidas cuando no se pueda escribir en `Flash_Parking`.
 - `GOOGLE_SERVICE_ACCOUNT_JSON_B64`: credenciales de service account en base64.
