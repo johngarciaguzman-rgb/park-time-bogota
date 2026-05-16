@@ -91,7 +91,15 @@ La hoja `Flash_Parking` funciona como bitácora de movimientos. La app agrega un
 - `Tipo de Movimiento`
 - `Hora de registro`
 
-Para escribir en esta hoja, la misma Service Account debe tener permiso **Editor** sobre el archivo de Google Sheets. Si no hay credenciales, la app sigue guardando en la base de datos local/central y omite el envío a Sheets.
+En el módulo **Movimiento Flash**, el operador ingresa el campo `Estacionamiento Asignado` con formato:
+
+```text
+E25,1
+```
+
+Donde `E25` es el número de estacionamiento y `1` es la ola/ciclo operativo. Ese valor se guarda completo en `Estacionamiento Asignado` y el sufijo después de la coma se usa como `Ciclo`.
+
+Para escribir en esta hoja, la misma Service Account debe tener permiso **Editor** sobre el archivo de Google Sheets. El módulo **Movimiento Flash** requiere esa configuración para evitar perder movimientos.
 
 ## Ejecutar localmente
 

@@ -372,10 +372,12 @@ Placa = Annotated[str, StringConstraints(strip_whitespace=True, min_length=4, ma
 ShortText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120)]
 OptionalText = Annotated[str, StringConstraints(strip_whitespace=True, max_length=300)]
 DeviceId = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120, pattern=r"^[A-Za-z0-9._:/-]+$")]
+EstacionamientoAsignado = Annotated[str, StringConstraints(strip_whitespace=True, min_length=4, max_length=40, pattern=r"^[Ee]\d{2,3},[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)?$")]
 Username = Annotated[str, StringConstraints(strip_whitespace=True, min_length=3, max_length=120, pattern=r"^[A-Za-z0-9@._-]+$")]
 Password = Annotated[str, StringConstraints(min_length=8, max_length=128)]
 LoginPassword = Annotated[str, StringConstraints(min_length=1, max_length=128)]
 Role = Annotated[str, StringConstraints(strip_whitespace=True, pattern=r"^(admin|operador)$")]
+MovementType = Annotated[str, StringConstraints(strip_whitespace=True, pattern=r"^(Ingreso|Salida)$")]
 
 
 class LoginRequest(BaseModel):
@@ -436,6 +438,35 @@ class SalidaRequest(BaseModel):
     device_id: Optional[DeviceId] = None
     lector_qr: Optional[FichaCode] = None
     observaciones: Optional[OptionalText] = None
+
+
+class FlashMovementRequest(BaseModel):
+    estacionamiento_asignado: EstacionamientoAsignado
+    tipo_movimiento: MovementType
+    device_id: Optional[DeviceId] = None
+    lector_qr: Optional[EstacionamientoAsignado] = None
+
+    @field_validator("estacionamiento_asignado", "lector_qr")
+    @classmethod
+    def estacionamiento_upper(cls, value: Optional[str]) -> Optional[str]:
+        if not value:
+            return value
+        return value.strip().upper().replace(" ", "")
+
+
+class FlashMovementResponse(BaseModel):
+    status: str
+    id: str
+    fecha: str
+    ciclo: str
+    dispositivo: str
+    lector_qr: str
+    estacionamiento_asignado: str
+    estacionamiento: str
+    ola_operativa: str
+    tipo_movimiento: str
+    hora_registro: str
+    sheet_logged: bool
 
 
 class VisitResponse(BaseModel):
@@ -668,6 +699,17 @@ def movement_cycle(recorded_at: datetime) -> str:
     return "PM"
 
 
+def parse_estacionamiento_asignado(value: str) -> tuple[str, str, str]:
+    compact = value.strip().upper().replace(" ", "")
+    before_dot = compact.split(".", 1)[0]
+    if "," not in before_dot:
+        raise HTTPException(status_code=422, detail="Formato esperado: E25,1")
+    estacionamiento, ola_operativa = before_dot.split(",", 1)
+    if not estacionamiento.startswith("E") or not estacionamiento[1:].isdigit() or not ola_operativa.isalnum():
+        raise HTTPException(status_code=422, detail="Formato esperado: E25,1")
+    return estacionamiento, ola_operativa, f"{estacionamiento},{ola_operativa}"
+
+
 def flash_assigned_dock(visit: ParkingVisit, lector_qr: Optional[str]) -> str:
     raw = (lector_qr or "").strip().upper()
     if raw:
@@ -678,23 +720,25 @@ def flash_assigned_dock(visit: ParkingVisit, lector_qr: Optional[str]) -> str:
     return visit.dock
 
 
-def append_flash_parking_log(
-    visit: ParkingVisit,
-    movement_type: str,
+def append_flash_parking_row(
     *,
+    row_id: str,
     recorded_at: datetime,
+    ciclo: str,
     device_id: Optional[str],
-    lector_qr: Optional[str],
+    lector_qr: str,
+    estacionamiento_asignado: str,
+    movement_type: str,
+    required: bool = False,
 ) -> bool:
-    """Best-effort append to the Flash_Parking Google Sheet.
-
-    The DB remains the source of truth for the app. The Sheet append is optional
-    by default so local tests and deployments without a writer service account
-    continue working.
-    """
     try:
         info = service_account_info()
         if not info:
+            if required:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Falta configurar una service account con permiso Editor para escribir en Flash_Parking",
+                )
             return False
 
         try:
@@ -712,12 +756,12 @@ def append_flash_parking_log(
         local_dt = to_local(recorded_at) or datetime.now(APP_TZ)
         values = [
             [
-                visit.id[:8],
+                row_id,
                 local_dt.strftime("%d/%m/%Y"),
-                movement_cycle(recorded_at),
+                ciclo,
                 (device_id or "").strip() or "web",
-                (lector_qr or visit.ficha_code).strip(),
-                flash_assigned_dock(visit, lector_qr),
+                lector_qr.strip(),
+                estacionamiento_asignado,
                 movement_type,
                 local_dt.strftime("%H:%M:%S"),
             ]
@@ -743,13 +787,45 @@ def append_flash_parking_log(
             raise HTTPException(status_code=502, detail="No se pudo escribir en Flash_Parking")
         return True
     except HTTPException:
-        if GOOGLE_FLASH_LOG_REQUIRED:
+        if required or GOOGLE_FLASH_LOG_REQUIRED:
             raise
         return False
     except Exception as exc:
-        if GOOGLE_FLASH_LOG_REQUIRED:
+        if required or GOOGLE_FLASH_LOG_REQUIRED:
             raise HTTPException(status_code=502, detail="No se pudo escribir en Flash_Parking") from exc
         return False
+
+
+def append_flash_parking_log(
+    visit: ParkingVisit,
+    movement_type: str,
+    *,
+    recorded_at: datetime,
+    device_id: Optional[str],
+    lector_qr: Optional[str],
+) -> bool:
+    """Best-effort append to the Flash_Parking Google Sheet.
+
+    The DB remains the source of truth for the app. The Sheet append is optional
+    by default so local tests and deployments without a writer service account
+    continue working.
+    """
+    estacionamiento_asignado = flash_assigned_dock(visit, lector_qr)
+    try:
+        _, ola_operativa, normalized = parse_estacionamiento_asignado(estacionamiento_asignado)
+        ciclo = ola_operativa
+        estacionamiento_asignado = normalized
+    except HTTPException:
+        ciclo = movement_cycle(recorded_at)
+    return append_flash_parking_row(
+        row_id=visit.id[:8],
+        recorded_at=recorded_at,
+        ciclo=ciclo,
+        device_id=device_id,
+        lector_qr=(lector_qr or visit.ficha_code).strip(),
+        estacionamiento_asignado=estacionamiento_asignado,
+        movement_type=movement_type,
+    )
 
 
 def row_value(row: dict[str, str], *names: str) -> str:
@@ -1390,6 +1466,41 @@ def plate_alerts(
         target_min=target_min,
         late_count_15d=late_count,
         should_agilizar=late_count >= 2,
+    )
+
+
+@app.post("/api/flash-parking/movement", response_model=FlashMovementResponse, status_code=201)
+def registrar_movimiento_flash(body: FlashMovementRequest, user: User = Depends(get_current_user)):
+    estacionamiento, ola_operativa, estacionamiento_asignado = parse_estacionamiento_asignado(
+        body.estacionamiento_asignado
+    )
+    now = utc_now()
+    row_id = secrets.token_hex(4)
+    lector_qr = body.lector_qr or body.estacionamiento_asignado
+    sheet_logged = append_flash_parking_row(
+        row_id=row_id,
+        recorded_at=now,
+        ciclo=ola_operativa,
+        device_id=body.device_id or user.username,
+        lector_qr=lector_qr,
+        estacionamiento_asignado=estacionamiento_asignado,
+        movement_type=body.tipo_movimiento,
+        required=True,
+    )
+    local_dt = to_local(now) or datetime.now(APP_TZ)
+    return FlashMovementResponse(
+        status="ok",
+        id=row_id,
+        fecha=local_dt.strftime("%d/%m/%Y"),
+        ciclo=ola_operativa,
+        dispositivo=(body.device_id or user.username).strip(),
+        lector_qr=lector_qr,
+        estacionamiento_asignado=estacionamiento_asignado,
+        estacionamiento=estacionamiento,
+        ola_operativa=ola_operativa,
+        tipo_movimiento=body.tipo_movimiento,
+        hora_registro=local_dt.strftime("%H:%M:%S"),
+        sheet_logged=sheet_logged,
     )
 
 
