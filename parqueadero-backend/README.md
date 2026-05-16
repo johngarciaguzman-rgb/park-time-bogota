@@ -45,7 +45,7 @@ Flujo operativo confirmado: **no se imprime nada**. El conductor recibe una fich
 La app puede sincronizar la hoja diaria `CONTROL ARRIBOS` del documento:
 
 ```text
-1GG6twSUKAn8LK_t4Q4WK3rMfJsdxRej2FD5pDI9wReU
+1UM29RveA97jOkbKFifBNDhRsD4GTlltD2DHyF1xwMLA
 ```
 
 Columnas esperadas:

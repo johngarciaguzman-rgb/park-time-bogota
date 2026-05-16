@@ -43,7 +43,7 @@ APP_ROLE_DEFAULT_PASSWORD=clave_segura_para_roles
 # O, si cada rol tiene clave diferente:
 # APP_ROLE_PASSWORDS_JSON={"Conductor":"...","Coordinador MLP":"...","Operación MELI":"..."}
 
-GOOGLE_SHEET_ID=1GG6twSUKAn8LK_t4Q4WK3rMfJsdxRej2FD5pDI9wReU
+GOOGLE_SHEET_ID=1UM29RveA97jOkbKFifBNDhRsD4GTlltD2DHyF1xwMLA
 GOOGLE_SHEET_NAME=CONTROL ARRIBOS
 GOOGLE_FLASH_SHEET_NAME=Flash_Parking
 GOOGLE_FLASH_LOG_REQUIRED=false
