@@ -41,6 +41,8 @@ OIDC_ADMIN_GROUPS=
 
 GOOGLE_SHEET_ID=1GG6twSUKAn8LK_t4Q4WK3rMfJsdxRej2FD5pDI9wReU
 GOOGLE_SHEET_NAME=CONTROL ARRIBOS
+GOOGLE_FLASH_SHEET_NAME=Flash_Parking
+GOOGLE_FLASH_LOG_REQUIRED=false
 GOOGLE_SERVICE_ACCOUNT_JSON_B64=base64_del_json_service_account
 ```
 
@@ -108,6 +110,10 @@ Si `oidc_enabled` sale `false`, falta `OIDC_CLIENT_ID`.
 ## Acceso a Google Sheets
 
 El documento está privado por defecto. Para producción, crea una **Google Service Account**, comparte el Sheet con su `client_email` y guarda el JSON como `GOOGLE_SERVICE_ACCOUNT_JSON_B64` en Vercel.
+
+- Para leer `CONTROL ARRIBOS`, la service account necesita acceso de lectura.
+- Para escribir cada ingreso/salida en `Flash_Parking`, la service account necesita permiso **Editor**.
+- `GOOGLE_FLASH_LOG_REQUIRED=false` permite que la app siga operando aunque Sheets no esté disponible. Cambia a `true` solo si quieres que la escritura en `Flash_Parking` sea obligatoria.
 
 Ejemplo local para obtener el base64:
 

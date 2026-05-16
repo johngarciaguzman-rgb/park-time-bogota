@@ -49,9 +49,11 @@ OIDC_ADMIN_GROUPS = {
 }
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "1GG6twSUKAn8LK_t4Q4WK3rMfJsdxRej2FD5pDI9wReU").strip()
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "CONTROL ARRIBOS").strip()
+GOOGLE_FLASH_SHEET_NAME = os.getenv("GOOGLE_FLASH_SHEET_NAME", "Flash_Parking").strip()
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 GOOGLE_SERVICE_ACCOUNT_JSON_B64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_B64", "").strip()
 GOOGLE_PUBLIC_CSV_URL = os.getenv("GOOGLE_PUBLIC_CSV_URL", "").strip()
+GOOGLE_FLASH_LOG_REQUIRED = os.getenv("GOOGLE_FLASH_LOG_REQUIRED", "false").strip().lower() in {"1", "true", "yes", "on"}
 ALLOWED_GOOGLE_HOSTS = {"docs.google.com", "sheets.googleapis.com"}
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./parqueadero.db")
@@ -320,10 +322,11 @@ def require_admin(user: User = Depends(get_current_user)) -> User:
     return user
 
 
-FichaCode = Annotated[str, StringConstraints(strip_whitespace=True, min_length=2, max_length=80, pattern=r"^[A-Za-z0-9._:/-]+$")]
+FichaCode = Annotated[str, StringConstraints(strip_whitespace=True, min_length=2, max_length=80, pattern=r"^[A-Za-z0-9._:/,-]+$")]
 Placa = Annotated[str, StringConstraints(strip_whitespace=True, min_length=4, max_length=16, pattern=r"^[A-Za-z0-9-]+$")]
 ShortText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120)]
 OptionalText = Annotated[str, StringConstraints(strip_whitespace=True, max_length=300)]
+DeviceId = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120, pattern=r"^[A-Za-z0-9._:/-]+$")]
 Username = Annotated[str, StringConstraints(strip_whitespace=True, min_length=3, max_length=120, pattern=r"^[A-Za-z0-9@._-]+$")]
 Password = Annotated[str, StringConstraints(min_length=8, max_length=128)]
 LoginPassword = Annotated[str, StringConstraints(min_length=1, max_length=128)]
@@ -366,6 +369,8 @@ class IngresoRequest(BaseModel):
     ubicacion: ShortText
     dock: ShortText
     arrival_slot_id: Optional[str] = Field(default=None, max_length=36)
+    device_id: Optional[DeviceId] = None
+    lector_qr: Optional[FichaCode] = None
     cedula: Optional[Annotated[str, StringConstraints(strip_whitespace=True, max_length=30, pattern=r"^[A-Za-z0-9._-]*$")]] = None
     conductor: Optional[OptionalText] = None
     observaciones: Optional[OptionalText] = None
@@ -378,6 +383,8 @@ class IngresoRequest(BaseModel):
 
 class SalidaRequest(BaseModel):
     ficha_code: FichaCode
+    device_id: Optional[DeviceId] = None
+    lector_qr: Optional[FichaCode] = None
     observaciones: Optional[OptionalText] = None
 
 
@@ -498,6 +505,16 @@ def normalize_code(value: str) -> str:
     return value.strip().upper().replace(" ", "")
 
 
+def scan_code_candidates(value: str) -> set[str]:
+    normalized = normalize_code(value)
+    candidates = {normalized} if normalized else set()
+    if "." in normalized:
+        candidates.add(normalized.split(".", 1)[0])
+    if "," in normalized:
+        candidates.add(normalized.split(",", 1)[0])
+    return {candidate for candidate in candidates if candidate}
+
+
 def validate_google_url(url: str) -> str:
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme != "https":
@@ -589,6 +606,100 @@ async def fetch_sheet_rows() -> tuple[list[list[str]], str]:
         )
     reader = csv.reader(StringIO(response.text))
     return [[cell for cell in row] for row in reader], "public_csv"
+
+
+def movement_cycle(recorded_at: datetime) -> str:
+    local_dt = to_local(recorded_at) or datetime.now(APP_TZ)
+    local_time = local_dt.time()
+    if local_time < time(11, 20):
+        return "AM"
+    if local_time < time(15, 35):
+        return "AMT"
+    return "PM"
+
+
+def flash_assigned_dock(visit: ParkingVisit, lector_qr: Optional[str]) -> str:
+    raw = (lector_qr or "").strip().upper()
+    if raw:
+        compact = raw.replace(" ", "")
+        before_dot = compact.split(".", 1)[0]
+        if "," in before_dot and len(before_dot) <= 40:
+            return before_dot
+    return visit.dock
+
+
+def append_flash_parking_log(
+    visit: ParkingVisit,
+    movement_type: str,
+    *,
+    recorded_at: datetime,
+    device_id: Optional[str],
+    lector_qr: Optional[str],
+) -> bool:
+    """Best-effort append to the Flash_Parking Google Sheet.
+
+    The DB remains the source of truth for the app. The Sheet append is optional
+    by default so local tests and deployments without a writer service account
+    continue working.
+    """
+    try:
+        info = service_account_info()
+        if not info:
+            return False
+
+        try:
+            from google.oauth2 import service_account
+            from google.auth.transport.requests import Request as GoogleAuthRequest
+        except ImportError as exc:
+            raise HTTPException(status_code=500, detail="Falta instalar google-auth") from exc
+
+        credentials = service_account.Credentials.from_service_account_info(
+            info,
+            scopes=["https://www.googleapis.com/auth/spreadsheets"],
+        )
+        credentials.refresh(GoogleAuthRequest())
+
+        local_dt = to_local(recorded_at) or datetime.now(APP_TZ)
+        values = [
+            [
+                visit.id[:8],
+                local_dt.strftime("%d/%m/%Y"),
+                movement_cycle(recorded_at),
+                (device_id or "").strip() or "web",
+                (lector_qr or visit.ficha_code).strip(),
+                flash_assigned_dock(visit, lector_qr),
+                movement_type,
+                local_dt.strftime("%H:%M:%S"),
+            ]
+        ]
+        quoted_range = urllib.parse.quote(f"{GOOGLE_FLASH_SHEET_NAME}!A:H", safe="")
+        url = (
+            f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/"
+            f"{quoted_range}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS"
+        )
+        validate_google_url(url)
+        with httpx.Client(timeout=20.0, follow_redirects=False) as client:
+            response = client.post(
+                url,
+                headers={"Authorization": f"Bearer {credentials.token}"},
+                json={"values": values},
+            )
+        if response.status_code == 403:
+            raise HTTPException(
+                status_code=403,
+                detail="La service account no tiene permiso de edición sobre Flash_Parking",
+            )
+        if response.status_code >= 400:
+            raise HTTPException(status_code=502, detail="No se pudo escribir en Flash_Parking")
+        return True
+    except HTTPException:
+        if GOOGLE_FLASH_LOG_REQUIRED:
+            raise
+        return False
+    except Exception as exc:
+        if GOOGLE_FLASH_LOG_REQUIRED:
+            raise HTTPException(status_code=502, detail="No se pudo escribir en Flash_Parking") from exc
+        return False
 
 
 def row_value(row: dict[str, str], *names: str) -> str:
@@ -744,14 +855,21 @@ def pending_arrival_slots(db: Session, day: Optional[date] = None) -> list[Arriv
 
 
 def find_pending_arrival_slots(db: Session, code: str, day: Optional[date] = None) -> list[ArrivalSlot]:
-    normalized = normalize_code(code)
-    if not normalized:
+    candidates = scan_code_candidates(code)
+    if not candidates:
         return []
-    return [
-        slot
-        for slot in pending_arrival_slots(db, day)
-        if normalize_code(slot.est_wtd) == normalized or normalize_code(slot.ruta_sorting) == normalized
-    ]
+    matches = []
+    for slot in pending_arrival_slots(db, day):
+        slot_codes = {
+            normalize_code(slot.est_wtd),
+            normalize_code(slot.ruta_sorting),
+        }
+        if slot.ola_wtd:
+            slot_codes.add(normalize_code(f"{slot.est_wtd},{slot.ola_wtd}"))
+            slot_codes.add(normalize_code(f"{slot.est_wtd}.{slot.ola_wtd}"))
+        if candidates.intersection(slot_codes):
+            matches.append(slot)
+    return matches
 
 
 def arrival_slot_for_ingreso(db: Session, body: IngresoRequest) -> Optional[ArrivalSlot]:
@@ -1114,7 +1232,7 @@ def arrivals_pending(
 
 @app.get("/api/arrivals/validate", response_model=ArrivalValidateResponse)
 def validate_arrival(
-    code: str = Query(..., min_length=2, max_length=80, pattern=r"^[A-Za-z0-9._:/ -]+$"),
+    code: str = Query(..., min_length=2, max_length=80, pattern=r"^[A-Za-z0-9._:/, -]+$"),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -1246,6 +1364,13 @@ def registrar_ingreso(body: IngresoRequest, db: Session = Depends(get_db), user:
         arrival_slot.updated_at = now
     db.commit()
     db.refresh(visit)
+    append_flash_parking_log(
+        visit,
+        "Ingreso",
+        recorded_at=now,
+        device_id=body.device_id or user.username,
+        lector_qr=body.lector_qr or body.ficha_code,
+    )
     return visit_to_response(visit)
 
 
@@ -1264,6 +1389,13 @@ def registrar_salida(body: SalidaRequest, db: Session = Depends(get_db), user: U
     visit.updated_at = now
     db.commit()
     db.refresh(visit)
+    append_flash_parking_log(
+        visit,
+        "Salida",
+        recorded_at=now,
+        device_id=body.device_id or user.username,
+        lector_qr=body.lector_qr or body.ficha_code,
+    )
     return visit_to_response(visit)
 
 

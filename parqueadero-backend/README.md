@@ -10,9 +10,10 @@ Flujo operativo confirmado: **no se imprime nada**. El conductor recibe una fich
 4. Si la ficha existe, completa ruta, zona/ubicación, MLP, SPR, ola y EST WTD.
 5. Registra placa y cédula.
 6. El sistema asocia esa ficha al vehículo y la descuenta de **PENDIENTES 1 ola**.
-7. Si otra persona recibe el vehículo, escanea la ficha y el sistema muestra ubicación + doka/dock.
-8. Al salir, el conductor entrega la ficha.
-9. En **Salida con ficha**, el operador escanea la ficha, confirma la salida y la ficha queda libre para reutilizarse.
+7. Cada ingreso/salida se envía también a la hoja **Flash_Parking** como bitácora operativa.
+8. Si otra persona recibe el vehículo, escanea la ficha y el sistema muestra ubicación + doka/dock.
+9. Al salir, el conductor entrega la ficha.
+10. En **Salida con ficha**, el operador escanea la ficha, confirma la salida y la ficha queda libre para reutilizarse.
 
 ## Datos que guarda
 
@@ -77,6 +78,21 @@ export GOOGLE_PUBLIC_CSV_URL="https://docs.google.com/spreadsheets/d/.../gviz/tq
 
 Si la hoja está privada y no hay service account, la app mostrará un error indicando que necesita acceso.
 
+## Google Sheets: Flash_Parking
+
+La hoja `Flash_Parking` funciona como bitácora de movimientos. La app agrega una fila por cada ingreso o salida con estas columnas:
+
+- `ID`
+- `Fecha`
+- `Ciclo`
+- `Dispositivo`
+- `Lector QR`
+- `Estacionamiento Asignado`
+- `Tipo de Movimiento`
+- `Hora de registro`
+
+Para escribir en esta hoja, la misma Service Account debe tener permiso **Editor** sobre el archivo de Google Sheets. Si no hay credenciales, la app sigue guardando en la base de datos local/central y omite el envío a Sheets.
+
 ## Ejecutar localmente
 
 ```bash
@@ -108,6 +124,8 @@ Copiar `.env.example` como referencia:
 - `LOCAL_LOGIN_ENABLED`: `true` para pruebas locales, `false` para obligar login MELI/Okta.
 - `GOOGLE_SHEET_ID`: ID del Google Sheet diario.
 - `GOOGLE_SHEET_NAME`: nombre de hoja; por defecto `CONTROL ARRIBOS`.
+- `GOOGLE_FLASH_SHEET_NAME`: hoja de bitácora de movimientos; por defecto `Flash_Parking`.
+- `GOOGLE_FLASH_LOG_REQUIRED`: `true` si quieres bloquear ingresos/salidas cuando no se pueda escribir en `Flash_Parking`.
 - `GOOGLE_SERVICE_ACCOUNT_JSON_B64`: credenciales de service account en base64.
 - `GOOGLE_PUBLIC_CSV_URL`: alternativa CSV público.
 
