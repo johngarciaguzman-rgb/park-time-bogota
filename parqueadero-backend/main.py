@@ -123,6 +123,15 @@ class ArrivalSlot(Base):
     spr = Column(String(40), nullable=True)
     ola_wtd = Column(String(40), index=True, nullable=True)
     disponible = Column(String(80), nullable=True)
+    placa = Column(String(16), index=True, nullable=True)
+    auxiliar = Column(String(120), nullable=True)
+    hora_limite = Column(String(40), nullable=True)
+    tmec = Column(String(40), nullable=True)
+    hora_citacion = Column(String(40), nullable=True)
+    distancia_km = Column(String(40), nullable=True)
+    paradas = Column(String(40), nullable=True)
+    whatsapp_url = Column(String(300), nullable=True)
+    arl_url = Column(String(300), nullable=True)
     active = Column(Boolean, nullable=False, default=True)
     assigned_visit_id = Column(String(36), index=True, nullable=True)
     assigned_at = Column(DateTime, nullable=True)
@@ -409,6 +418,15 @@ class ArrivalSlotResponse(BaseModel):
     spr: Optional[str]
     ola_wtd: Optional[str]
     disponible: Optional[str]
+    placa: Optional[str]
+    auxiliar: Optional[str]
+    hora_limite: Optional[str]
+    tmec: Optional[str]
+    hora_citacion: Optional[str]
+    distancia_km: Optional[str]
+    paradas: Optional[str]
+    whatsapp_url: Optional[str]
+    arl_url: Optional[str]
     pending: bool
     assigned_visit_id: Optional[str]
 
@@ -432,6 +450,25 @@ class FichaStatusResponse(BaseModel):
     ficha_code: str
     estado: str
     visit: Optional[VisitResponse]
+
+
+class ArrivalSlotUpdateRequest(BaseModel):
+    placa: Optional[Placa] = None
+    auxiliar: Optional[OptionalText] = None
+    hora_limite: Optional[Annotated[str, StringConstraints(strip_whitespace=True, max_length=40)]] = None
+    tmec: Optional[Annotated[str, StringConstraints(strip_whitespace=True, max_length=40)]] = None
+
+    @field_validator("placa")
+    @classmethod
+    def placa_upper(cls, value: Optional[str]) -> Optional[str]:
+        return normalize_placa(value) if value else value
+
+
+class PlateAlertResponse(BaseModel):
+    placa: str
+    target_min: int
+    late_count_15d: int
+    should_agilizar: bool
 
 
 def format_duration(minutes: Optional[int]) -> str:
@@ -599,6 +636,15 @@ def parse_arrival_rows(rows: list[list[str]]) -> list[dict[str, str | int]]:
                 "spr": row_value(row_map, "spr")[:40] or None,
                 "ola_wtd": row_value(row_map, "ola wtd", "ola")[:40] or None,
                 "disponible": row_value(row_map, "disponible")[:80] or None,
+                "placa": row_value(row_map, "placa", "plate", "patente")[:16] or None,
+                "auxiliar": row_value(row_map, "auxiliar", "driver helper")[:120] or None,
+                "hora_limite": row_value(row_map, "hora limite", "hora límite", "time hs", "time")[:40] or None,
+                "tmec": row_value(row_map, "tmec", "tme c", "tiempo maximo de cargue", "tiempo maximo cargue")[:40] or None,
+                "hora_citacion": row_value(row_map, "hora citacion", "hora de citacion", "hora citación", "hora de citación")[:40] or None,
+                "distancia_km": row_value(row_map, "distancia km", "km", "distancia")[:40] or None,
+                "paradas": row_value(row_map, "paradas", "stops")[:40] or None,
+                "whatsapp_url": row_value(row_map, "whatsapp", "link whatsapp", "grupo whatsapp")[:300] or None,
+                "arl_url": row_value(row_map, "arl", "qr arl", "link arl")[:300] or None,
             }
         )
     return parsed
@@ -614,6 +660,15 @@ def slot_to_response(slot: ArrivalSlot) -> dict:
         "spr": slot.spr,
         "ola_wtd": slot.ola_wtd,
         "disponible": slot.disponible,
+        "placa": slot.placa,
+        "auxiliar": slot.auxiliar,
+        "hora_limite": slot.hora_limite,
+        "tmec": slot.tmec,
+        "hora_citacion": slot.hora_citacion,
+        "distancia_km": slot.distancia_km,
+        "paradas": slot.paradas,
+        "whatsapp_url": slot.whatsapp_url,
+        "arl_url": slot.arl_url,
         "pending": slot.active and not slot.assigned_visit_id,
         "assigned_visit_id": slot.assigned_visit_id,
     }
@@ -743,8 +798,21 @@ def ensure_schema_columns() -> None:
                     connection.execute(text(ddl))
         if "arrival_slots" in existing_tables:
             columns = {column["name"] for column in inspector.get_columns("arrival_slots")}
-            if "disponible" not in columns:
-                connection.execute(text("ALTER TABLE arrival_slots ADD COLUMN disponible VARCHAR(80)"))
+            slot_migrations = {
+                "disponible": "ALTER TABLE arrival_slots ADD COLUMN disponible VARCHAR(80)",
+                "placa": "ALTER TABLE arrival_slots ADD COLUMN placa VARCHAR(16)",
+                "auxiliar": "ALTER TABLE arrival_slots ADD COLUMN auxiliar VARCHAR(120)",
+                "hora_limite": "ALTER TABLE arrival_slots ADD COLUMN hora_limite VARCHAR(40)",
+                "tmec": "ALTER TABLE arrival_slots ADD COLUMN tmec VARCHAR(40)",
+                "hora_citacion": "ALTER TABLE arrival_slots ADD COLUMN hora_citacion VARCHAR(40)",
+                "distancia_km": "ALTER TABLE arrival_slots ADD COLUMN distancia_km VARCHAR(40)",
+                "paradas": "ALTER TABLE arrival_slots ADD COLUMN paradas VARCHAR(40)",
+                "whatsapp_url": "ALTER TABLE arrival_slots ADD COLUMN whatsapp_url VARCHAR(300)",
+                "arl_url": "ALTER TABLE arrival_slots ADD COLUMN arl_url VARCHAR(300)",
+            }
+            for column_name, ddl in slot_migrations.items():
+                if column_name not in columns:
+                    connection.execute(text(ddl))
 
 
 def seed_admin_user() -> None:
@@ -988,6 +1056,15 @@ async def sync_arrivals(db: Session = Depends(get_db), user: User = Depends(get_
         slot.spr = row["spr"] if isinstance(row["spr"], str) else None
         slot.ola_wtd = row["ola_wtd"] if isinstance(row["ola_wtd"], str) else None
         slot.disponible = row["disponible"] if isinstance(row["disponible"], str) else None
+        slot.placa = normalize_placa(str(row["placa"])) if isinstance(row["placa"], str) and row["placa"] else None
+        slot.auxiliar = row["auxiliar"] if isinstance(row["auxiliar"], str) else None
+        slot.hora_limite = row["hora_limite"] if isinstance(row["hora_limite"], str) else None
+        slot.tmec = row["tmec"] if isinstance(row["tmec"], str) else None
+        slot.hora_citacion = row["hora_citacion"] if isinstance(row["hora_citacion"], str) else None
+        slot.distancia_km = row["distancia_km"] if isinstance(row["distancia_km"], str) else None
+        slot.paradas = row["paradas"] if isinstance(row["paradas"], str) else None
+        slot.whatsapp_url = row["whatsapp_url"] if isinstance(row["whatsapp_url"], str) else None
+        slot.arl_url = row["arl_url"] if isinstance(row["arl_url"], str) else None
         slot.sheet_id = GOOGLE_SHEET_ID
         slot.sheet_name = GOOGLE_SHEET_NAME
         slot.source_row = int(row["source_row"])
@@ -1058,6 +1135,59 @@ def validate_arrival(
         status="multiple",
         message="La ficha coincide con varias rutas; selecciona una para asignarla.",
         matches=[slot_to_response(row) for row in matches],
+    )
+
+
+@app.patch("/api/arrivals/{slot_id}", response_model=ArrivalSlotResponse)
+def update_arrival_slot(
+    slot_id: str,
+    body: ArrivalSlotUpdateRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    slot = db.scalar(select(ArrivalSlot).where(ArrivalSlot.id == slot_id, ArrivalSlot.active.is_(True)))
+    if not slot:
+        raise HTTPException(status_code=404, detail="No encontré esa ruta pendiente")
+    if slot.assigned_visit_id:
+        raise HTTPException(status_code=409, detail="La ruta ya fue asignada a un vehículo")
+    if body.placa is not None:
+        slot.placa = body.placa
+    if body.auxiliar is not None:
+        slot.auxiliar = body.auxiliar
+    if body.hora_limite is not None:
+        slot.hora_limite = body.hora_limite
+    if body.tmec is not None:
+        slot.tmec = body.tmec
+    slot.updated_at = utc_now()
+    db.commit()
+    db.refresh(slot)
+    return slot_to_response(slot)
+
+
+@app.get("/api/plates/{placa}/alerts", response_model=PlateAlertResponse)
+def plate_alerts(
+    placa: str,
+    target_min: int = Query(default=18, ge=1, le=24 * 60),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    normalized = normalize_placa(placa)
+    if not normalized or len(normalized) < 4:
+        raise HTTPException(status_code=422, detail="Placa inválida")
+    start = utc_now() - timedelta(days=15)
+    rows = db.scalars(
+        select(ParkingVisit).where(
+            ParkingVisit.placa == normalized,
+            ParkingVisit.salida_at.is_not(None),
+            ParkingVisit.salida_at >= start,
+        )
+    ).all()
+    late_count = sum(1 for row in rows if (row.duracion_min or 0) > target_min)
+    return PlateAlertResponse(
+        placa=normalized,
+        target_min=target_min,
+        late_count_15d=late_count,
+        should_agilizar=late_count >= 2,
     )
 
 
