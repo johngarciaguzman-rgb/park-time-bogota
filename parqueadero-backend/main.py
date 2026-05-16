@@ -186,6 +186,24 @@ class ArrivalSlot(Base):
     updated_at = Column(DateTime, nullable=False, default=lambda: utc_now())
 
 
+class FlashParkingMovement(Base):
+    __tablename__ = "flash_parking_movements"
+
+    id = Column(String(16), primary_key=True)
+    fecha = Column(String(20), index=True, nullable=False)
+    ciclo = Column(String(40), index=True, nullable=False)
+    dispositivo = Column(String(120), nullable=False)
+    lector_qr = Column(String(80), nullable=False)
+    estacionamiento_asignado = Column(String(40), index=True, nullable=False)
+    estacionamiento = Column(String(20), index=True, nullable=False)
+    ola_operativa = Column(String(40), index=True, nullable=False)
+    tipo_movimiento = Column(String(20), index=True, nullable=False)
+    hora_registro = Column(String(20), nullable=False)
+    sheet_logged = Column(Boolean, nullable=False, default=False)
+    operador = Column(String(120), nullable=False)
+    created_at = Column(DateTime, nullable=False, default=lambda: utc_now())
+
+
 def utc_now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -1724,7 +1742,11 @@ def plate_alerts(
 
 
 @app.post("/api/flash-parking/movement", response_model=FlashMovementResponse, status_code=201)
-def registrar_movimiento_flash(body: FlashMovementRequest, user: User = Depends(get_current_user)):
+def registrar_movimiento_flash(
+    body: FlashMovementRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
     estacionamiento, ola_operativa, estacionamiento_asignado = parse_estacionamiento_asignado(
         body.estacionamiento_asignado
     )
@@ -1739,9 +1761,26 @@ def registrar_movimiento_flash(body: FlashMovementRequest, user: User = Depends(
         lector_qr=lector_qr,
         estacionamiento_asignado=estacionamiento_asignado,
         movement_type=body.tipo_movimiento,
-        required=True,
+        required=GOOGLE_FLASH_LOG_REQUIRED,
     )
     local_dt = to_local(now) or datetime.now(APP_TZ)
+    movimiento = FlashParkingMovement(
+        id=row_id,
+        fecha=local_dt.strftime("%d/%m/%Y"),
+        ciclo=ola_operativa,
+        dispositivo=(body.device_id or user.username).strip(),
+        lector_qr=lector_qr,
+        estacionamiento_asignado=estacionamiento_asignado,
+        estacionamiento=estacionamiento,
+        ola_operativa=ola_operativa,
+        tipo_movimiento=body.tipo_movimiento,
+        hora_registro=local_dt.strftime("%H:%M:%S"),
+        sheet_logged=sheet_logged,
+        operador=user.username,
+        created_at=now,
+    )
+    db.add(movimiento)
+    db.commit()
     return FlashMovementResponse(
         status="ok",
         id=row_id,
