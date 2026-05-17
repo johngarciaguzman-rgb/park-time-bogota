@@ -1,0 +1,16 @@
+{
+  "name": "Park Time Bogotá",
+  "short_name": "Park Time",
+  "description": "Control de ingreso, salida y monitoreo de parqueadero por fichas.",
+  "start_url": "/?source=pwa",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#f7f8fa",
+  "theme_color": "#edf343",
+  "categories": ["business", "productivity", "utilities"],
+  "icons": [
+    {"src": "/static/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+    {"src": "/static/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"}
+  ]
+}

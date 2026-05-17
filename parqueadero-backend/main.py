@@ -2172,3 +2172,23 @@ def index():
     if index_file.exists():
         return FileResponse(index_file)
     return Response("Sistema de Parqueadero API", media_type="text/plain")
+
+
+@app.get("/manifest.webmanifest")
+def manifest():
+    manifest_file = STATIC_DIR / "manifest.webmanifest"
+    if manifest_file.exists():
+        return FileResponse(manifest_file, media_type="application/manifest+json")
+    raise HTTPException(status_code=404, detail="Manifest no encontrado")
+
+
+@app.get("/sw.js")
+def service_worker():
+    service_worker_file = STATIC_DIR / "sw.js"
+    if service_worker_file.exists():
+        return FileResponse(
+            service_worker_file,
+            media_type="application/javascript",
+            headers={"Service-Worker-Allowed": "/"},
+        )
+    raise HTTPException(status_code=404, detail="Service worker no encontrado")

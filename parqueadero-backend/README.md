@@ -143,6 +143,20 @@ Copiar `.env.example` como referencia:
 - `GOOGLE_SERVICE_ACCOUNT_JSON_B64`: credenciales de service account en base64.
 - `GOOGLE_PUBLIC_CSV_URL`: alternativa CSV público.
 
+## Instalar como app en celular o computador
+
+La app está preparada como PWA. Todos los dispositivos deben abrir la URL de producción para alimentar la misma base central:
+
+```text
+https://park-time-bogota.vercel.app
+```
+
+- **Android / Chrome**: abrir la URL → menú ⋮ → **Agregar a pantalla principal** o **Instalar app**.
+- **iPhone / Safari**: abrir la URL → botón compartir → **Agregar a pantalla de inicio**.
+- **PC / Chrome o Edge**: abrir la URL → icono de instalar en la barra de direcciones.
+
+Cada ingreso/salida registrado desde cualquier dispositivo queda enviado al backend central. Si está configurado `GOOGLE_FLASH_WEBHOOK_URL` o una service account, también se escribe en `Flash_Parking`.
+
 ## Para varios puestos de trabajo
 
 Todos los puestos deben abrir la misma URL del servidor. La base de datos queda centralizada; por eso todos ven los mismos ingresos, salidas, fichas ocupadas e historial diario.
